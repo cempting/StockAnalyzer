@@ -501,7 +501,8 @@ with tab3:
             r1m     = [s["ret_1m"]   for s in stks if s.get("ret_1m")  is not None]
             r3m     = [s["ret_3m"]   for s in stks if s.get("ret_3m")  is not None]
             top_s   = max(stks, key=lambda x: x["score"])
-            etf_t   = config.INDUSTRY_ETFS.get(ind)
+            industry_etfs = getattr(config, "INDUSTRY_ETFS", {})
+            etf_t   = industry_etfs.get(ind) if isinstance(industry_etfs, dict) else None
             ind_rows.append({
                 "industry":   ind,
                 "sector":     data["sector"],

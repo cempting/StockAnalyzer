@@ -54,7 +54,7 @@ def _sector_heatmap_b64(df: pd.DataFrame, title: str) -> Optional[str]:
     if not cols:
         return None
 
-    data = df[cols].fillna(0).values
+    data = df[cols].fillna(0).astype(float).values
     sectors = list(df.index)
 
     fig, ax = plt.subplots(figsize=(9, max(3, len(sectors) * 0.45)),

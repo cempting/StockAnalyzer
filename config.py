@@ -151,6 +151,99 @@ def get_universe(name: str = "broad") -> list:
     return all_tickers
 
 # ─────────────────────────────────────────────────────────────────────────────
+# INDUSTRY ETFs  (best-effort mapping from yfinance industry string → ETF ticker)
+# Used for mini sparklines in the Industries drill-down view.
+# Industries not listed here are still shown in the table — just without a chart.
+# ─────────────────────────────────────────────────────────────────────────────
+
+INDUSTRY_ETFS = {
+    # ── Technology ────────────────────────────────────────────────────────────
+    "Semiconductors":                    "SOXX",   # iShares PHLX Semiconductor
+    "Semiconductor Equipment & Materials": "SOXX",
+    "Software—Application":              "IGV",    # iShares S&P Software & Services
+    "Software—Infrastructure":           "IGV",
+    "Information Technology Services":   "IGV",
+    "Electronic Components":             "SOXX",
+    "Computer Hardware":                 "XLK",
+    # ── Healthcare ────────────────────────────────────────────────────────────
+    "Biotechnology":                     "XBI",    # SPDR S&P Biotech
+    "Drug Manufacturers—General":        "PJP",    # Invesco Pharma
+    "Drug Manufacturers—Specialty":      "PJP",
+    "Medical Devices":                   "IHI",    # iShares Medical Devices
+    "Medical Instruments & Supplies":    "IHI",
+    "Diagnostics & Research":            "IHI",
+    "Health Care Plans":                 "IHF",    # iShares Healthcare Providers
+    "Medical Care Facilities":           "IHF",
+    "Health Information Services":       "IHF",
+    # ── Financials ────────────────────────────────────────────────────────────
+    "Banks—Diversified":                 "KBE",    # SPDR Bank
+    "Banks—Regional":                    "KRE",    # SPDR Regional Banking
+    "Asset Management":                  "IAI",    # iShares Broker-Dealers
+    "Capital Markets":                   "IAI",
+    "Insurance—Diversified":             "KIE",    # SPDR Insurance
+    "Insurance—Life":                    "KIE",
+    "Insurance—Property & Casualty":     "KIE",
+    "Financial Data & Stock Exchanges":  "IAI",
+    # ── Energy ────────────────────────────────────────────────────────────────
+    "Oil & Gas E&P":                     "XOP",    # SPDR Oil & Gas E&P
+    "Oil & Gas Integrated":              "XLE",    # SPDR Energy
+    "Oil & Gas Equipment & Services":    "OIH",    # VanEck Oil Services
+    "Oil & Gas Refining & Marketing":    "CRAK",   # VanEck Oil Refiners
+    "Oil & Gas Midstream":               "AMLP",   # Alerian MLP
+    # ── Consumer Discretionary ───────────────────────────────────────────────
+    "Specialty Retail":                  "XRT",    # SPDR Retail
+    "Internet Retail":                   "IBUY",   # Amplify Online Retail
+    "Auto Manufacturers":                "CARZ",   # Global X Autonomous & EV
+    "Restaurants":                       "BITE",
+    "Apparel Manufacturing":             "XRT",
+    "Footwear & Accessories":            "XRT",
+    "Luxury Goods":                      "LUXE",
+    # ── Consumer Staples ─────────────────────────────────────────────────────
+    "Beverages—Non-Alcoholic":           "PBJ",    # Invesco Food & Beverage
+    "Beverages—Alcoholic":               "PBJ",
+    "Food Distribution":                 "PBJ",
+    "Grocery Stores":                    "XLP",    # SPDR Consumer Staples
+    "Household & Personal Products":     "XLP",
+    "Tobacco":                           "XLP",
+    # ── Industrials ──────────────────────────────────────────────────────────
+    "Aerospace & Defense":               "ITA",    # iShares Aerospace & Defense
+    "Airlines":                          "JETS",   # US Global Jets
+    "Trucking":                          "IYT",    # iShares Transportation
+    "Railroads":                         "IYT",
+    "Air Freight & Logistics":           "IYT",
+    "Specialty Industrial Machinery":    "XLI",    # SPDR Industrials
+    "Electrical Equipment & Parts":      "XLI",
+    "Engineering & Construction":        "XLI",
+    # ── Real Estate ──────────────────────────────────────────────────────────
+    "REIT—Residential":                  "REZ",    # iShares Residential REIT
+    "REIT—Retail":                       "RTL",
+    "REIT—Industrial":                   "INDS",   # Pacer Industrial REIT
+    "REIT—Office":                       "NURE",
+    "REIT—Healthcare Facilities":        "CURE",
+    "REIT—Diversified":                  "VNQ",    # Vanguard Real Estate
+    "Real Estate Services":              "VNQ",
+    # ── Materials ────────────────────────────────────────────────────────────
+    "Gold":                              "GDX",    # VanEck Gold Miners
+    "Silver":                            "SIL",    # Global X Silver Miners
+    "Steel":                             "SLX",    # VanEck Steel
+    "Chemicals":                         "XLB",    # SPDR Materials
+    "Specialty Chemicals":               "XLB",
+    "Agricultural Inputs":               "MOO",    # VanEck Agribusiness
+    "Copper":                            "COPX",   # Global X Copper Miners
+    # ── Communication ────────────────────────────────────────────────────────
+    "Internet Content & Information":    "SOCL",   # Global X Social Media
+    "Telecom Services":                  "IYZ",    # iShares US Telecom
+    "Entertainment":                     "IYZ",
+    "Electronic Gaming & Multimedia":    "HERO",   # Global X Video Games
+    "Broadcasting":                      "IYZ",
+    # ── Utilities ────────────────────────────────────────────────────────────
+    "Utilities—Regulated Electric":      "XLU",    # SPDR Utilities
+    "Utilities—Renewable":               "ICLN",   # iShares Global Clean Energy
+    "Utilities—Diversified":             "XLU",
+    "Solar":                             "TAN",    # Invesco Solar
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FELIX PREHN SCREENING THRESHOLDS
 # ─────────────────────────────────────────────────────────────────────────────
 

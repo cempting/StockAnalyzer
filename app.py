@@ -76,6 +76,18 @@ def _score_style(val):
         return ""
 
 
+def _trend_arrow(val: Optional[float], decimals: int = 1) -> str:
+    """Return trend indicator based on displayed rounding to avoid tiny-value false positives."""
+    if val is None or pd.isna(val):
+        return "⚪"
+    shown = round(float(val), decimals)
+    if shown > 0:
+        return "🟢"
+    if shown < 0:
+        return "🔴"
+    return "⚪"
+
+
 def score_badge_md(score: int, rating: str) -> str:
     colors = {
         "STRONG BUY": "🟢",
@@ -117,8 +129,11 @@ def _mini_chart(df: Optional[pd.DataFrame], days: int = 90) -> Optional[bytes]:
     ax.set_facecolor("#1e1e2e")
 
     dates     = plot_df.index
-    net_chg   = float(close.iloc[-1]) - float(close.iloc[0])
-    line_clr  = "#a6e3a1" if net_chg >= 0 else "#f38ba8"
+    start_px = float(close.iloc[0])
+    end_px   = float(close.iloc[-1])
+    net_pct  = ((end_px / start_px) - 1.0) * 100.0 if start_px else 0.0
+    shown_pct = round(net_pct, 1)
+    line_clr = "#a6e3a1" if shown_pct > 0 else "#f38ba8" if shown_pct < 0 else "#94a3b8"
 
     ax.plot(dates, close, color=line_clr, lw=1.4, zorder=3)
     ax.fill_between(dates, close, float(close.min()) * 0.999,
@@ -173,7 +188,7 @@ with st.sidebar:
     )
 
     st.divider()
-    run_btn = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
+    run_btn = st.button("🚀 Run Analysis", type="primary", width="stretch")
 
     if "run_time" in st.session_state:
         st.success(f"Last run: {st.session_state.run_time}")
@@ -185,7 +200,7 @@ with st.sidebar:
                     data=_f.read(),
                     file_name=os.path.basename(_ctx.report_path),
                     mime="text/html",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
     st.divider()
@@ -355,9 +370,10 @@ st.divider()
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🌐 Market Overview",
     "🔄 Sector Rotation",
+    "🏭 Industries",
     "🎯 Screened Stocks",
     "🔍 Deep Dive",
 ])
@@ -393,7 +409,7 @@ with tab1:
             .format({c: "{:+.2f}%" for c in pct_cols}, na_rep="–")
             .format({"Last": "{:.2f}"}, na_rep="–")
         )
-        st.dataframe(styled, use_container_width=True, height=380)
+        st.dataframe(styled, width="stretch", height=380)
 
         # Uptrend count badge
         up = ctx.uptrend_count
@@ -445,17 +461,17 @@ with tab2:
             for gc, (name, etf) in zip(grid_cols, chunk):
                 df_etf = fetch_ohlcv(etf, period="6mo")
                 img    = _mini_chart(df_etf)
-                ret_1m = None
-                if df_rank is not None and name in df_rank.index and "1mo" in df_rank.columns:
-                    v = df_rank.loc[name, "1mo"]
-                    ret_1m = None if pd.isna(v) else float(v)
+                ret_1w = None
+                if df_rank is not None and name in df_rank.index and "1wk" in df_rank.columns:
+                    v = df_rank.loc[name, "1wk"]
+                    ret_1w = None if pd.isna(v) else float(v)
                 is_leader  = name in leaders
                 leader_tag = " 🏆" if is_leader else ""
-                pct_str    = f"{ret_1m:+.1f}%" if ret_1m is not None else "–"
-                arrow      = "🟢" if ret_1m and ret_1m > 0 else "🔴" if ret_1m and ret_1m < 0 else "⚪"
+                pct_str    = f"{ret_1w:+.1f}%" if ret_1w is not None else "–"
+                arrow      = _trend_arrow(ret_1w)
                 with gc:
                     if img:
-                        st.image(img, use_column_width=True)
+                        st.image(img, width='stretch')
                     st.caption(f"{arrow} **{name}**{leader_tag}  \n1M: {pct_str}")
 
     _render_sector_tab(ctx.us_sector_rank, ctx.leading_us_sectors, "🇺🇸 US Sectors", config.US_SECTOR_ETFS)
@@ -463,8 +479,192 @@ with tab2:
     _render_sector_tab(ctx.eu_sector_rank, ctx.leading_eu_sectors, "🇪🇺 EU Sectors", config.EU_SECTOR_ETFS)
 
 
-# ── TAB 3: SCREENED STOCKS ────────────────────────────────────────────────────
+# ── TAB 3: INDUSTRIES ────────────────────────────────────────────────────────
 with tab3:
+    if not stocks:
+        st.info("Run the analysis first — industry data is derived from screened stocks.")
+    else:
+        # ── Build industry summary from screened stocks ───────────────────────
+        industry_groups: dict = {}
+        for s in stocks:
+            ind = (s.get("industry") or "").strip() or "Unclassified"
+            sec = (s.get("sector")   or "").strip() or "Other"
+            if ind not in industry_groups:
+                industry_groups[ind] = {"sector": sec, "stocks": []}
+            industry_groups[ind]["stocks"].append(s)
+
+        ind_rows = []
+        for ind, data in industry_groups.items():
+            stks    = data["stocks"]
+            scores  = [s["score"]    for s in stks]
+            r1w     = [s["ret_1w"]   for s in stks if s.get("ret_1w")  is not None]
+            r1m     = [s["ret_1m"]   for s in stks if s.get("ret_1m")  is not None]
+            r3m     = [s["ret_3m"]   for s in stks if s.get("ret_3m")  is not None]
+            top_s   = max(stks, key=lambda x: x["score"])
+            etf_t   = config.INDUSTRY_ETFS.get(ind)
+            ind_rows.append({
+                "industry":   ind,
+                "sector":     data["sector"],
+                "count":      len(stks),
+                "avg_score":  round(sum(scores) / len(scores), 1),
+                "avg_1w":     round(sum(r1w) / len(r1w), 2) if r1w else None,
+                "avg_1m":     round(sum(r1m) / len(r1m), 2) if r1m else None,
+                "avg_3m":     round(sum(r3m) / len(r3m), 2) if r3m else None,
+                "top_stock":  top_s["ticker"],
+                "top_score":  top_s["score"],
+                "etf":        etf_t or "–",
+                "_stocks":    stks,
+            })
+        ind_rows.sort(key=lambda x: x["avg_score"], reverse=True)
+
+        # ── Sector filter ─────────────────────────────────────────────────────
+        all_sectors = sorted({r["sector"] for r in ind_rows})
+        sel_sector  = st.selectbox(
+            "Filter by Sector",
+            ["All sectors"] + all_sectors,
+            key="ind_sector_filter",
+        )
+        filtered_ind = (
+            ind_rows if sel_sector == "All sectors"
+            else [r for r in ind_rows if r["sector"] == sel_sector]
+        )
+
+        # ── Industry summary table ────────────────────────────────────────────
+        st.markdown("#### Industry Summary")
+        tbl_rows = []
+        for r in filtered_ind:
+            tbl_rows.append({
+                "Industry":   r["industry"],
+                "Sector":     r["sector"],
+                "# Stocks":   r["count"],
+                "Avg Score":  r["avg_score"],
+                "Avg 1M%":    r["avg_1m"],
+                "Avg 3M%":    r["avg_3m"],
+                "Top Stock":  r["top_stock"],
+                "Top Score":  r["top_score"],
+                "ETF":        r["etf"],
+            })
+        df_ind = pd.DataFrame(tbl_rows)
+
+        def _ind_score_style(val):
+            try:
+                v = float(val)
+                if v >= 72: return "background-color:#0d2b0d;color:#2da44e;font-weight:bold"
+                if v >= 58: return "background-color:#0d1a2b;color:#0969da;font-weight:bold"
+                if v >= 42: return "background-color:#2b2b0d;color:#bf8700;font-weight:bold"
+                return "background-color:#2b0d0d;color:#cf222e;font-weight:bold"
+            except (TypeError, ValueError):
+                return ""
+
+        styled_ind = (
+            df_ind.style
+            .map(_ind_score_style, subset=["Avg Score", "Top Score"])
+            .map(_pct_style,       subset=["Avg 1M%", "Avg 3M%"])
+            .format({"Avg 1M%": "{:+.2f}%", "Avg 3M%": "{:+.2f}%"}, na_rep="–")
+            .format({"Avg Score": "{:.1f}", "Top Score": "{:.0f}"})
+        )
+        st.dataframe(styled_ind, width="stretch", height=min(600, 60 + len(tbl_rows) * 36))
+        st.caption(
+            "Industries derived from Yahoo Finance metadata.  "
+            "ETF column = representative industry ETF where one exists."
+        )
+
+        # ── Industry ETF sparklines ───────────────────────────────────────────
+        etf_industries = [r for r in filtered_ind if r["etf"] != "–"]
+        if etf_industries:
+            st.markdown("#### Industry ETF Sparklines – Price & MA50 (3 months)")
+            COLS = 4
+            for i in range(0, len(etf_industries), COLS):
+                chunk     = etf_industries[i : i + COLS]
+                grid_cols = st.columns(COLS)
+                for gc, r in zip(grid_cols, chunk):
+                    df_etf = fetch_ohlcv(r["etf"], period="6mo")
+                    img    = _mini_chart(df_etf)
+                    score_icon = (
+                        "🟢" if r["avg_score"] >= 72 else
+                        "🔵" if r["avg_score"] >= 58 else
+                        "🟡" if r["avg_score"] >= 42 else "🔴"
+                    )
+                    avg_1w  = r["avg_1m"]
+                    pct_str = f"{avg_1w:+.1f}%" if avg_1w is not None else "–"
+                    arrow   = _trend_arrow(avg_1w)
+                    with gc:
+                        if img:
+                            st.image(img)
+                        st.caption(
+                            f"{score_icon} **{r['industry'][:22]}**  \n"
+                            f"{r['etf']}  ·  {arrow} 1M avg: {pct_str}  ·  {r['count']} stocks"
+                        )
+
+        # ── Industry drill-down: stocks filter ───────────────────────────────
+        st.divider()
+        st.markdown("#### Stocks by Industry")
+        ind_names      = ["All industries"] + [r["industry"] for r in filtered_ind]
+        sel_industry   = st.selectbox("Filter by Industry", ind_names, key="ind_drill")
+
+        if sel_industry == "All industries":
+            drill_stocks = [s for r in filtered_ind for s in r["_stocks"]]
+        else:
+            match = next((r for r in filtered_ind if r["industry"] == sel_industry), None)
+            drill_stocks = match["_stocks"] if match else []
+
+        if drill_stocks:
+            drill_rows = []
+            for s in sorted(drill_stocks, key=lambda x: x["score"], reverse=True):
+                drill_rows.append({
+                    "Ticker":  s["ticker"],
+                    "Name":    (s.get("name") or "")[:28],
+                    "Industry":(s.get("industry") or "")[:30],
+                    "Score":   s["score"],
+                    "Stage":   f"S{s.get('stage','?')}",
+                    "1W%":     s.get("ret_1w"),
+                    "1M%":     s.get("ret_1m"),
+                    "3M%":     s.get("ret_3m"),
+                    "1Y%":     s.get("ret_1y"),
+                    "RS%":     s.get("rs_bench"),
+                    "RSI":     round(s["rsi"], 0) if s.get("rsi") else None,
+                    "P/E":     round(s["pe"],  1) if s.get("pe")  else None,
+                })
+            df_drill = pd.DataFrame(drill_rows)
+            pct_d    = ["1M%", "3M%", "1Y%", "RS%"]
+            styled_drill = (
+                df_drill.style
+                .map(_score_style, subset=["Score"])
+                .map(_stage_style, subset=["Stage"])
+                .map(_pct_style,   subset=pct_d)
+                .format({c: "{:+.2f}%" for c in pct_d}, na_rep="–")
+                .format({"P/E": "{:.1f}", "RSI": "{:.0f}"}, na_rep="–")
+            )
+            st.dataframe(styled_drill, width="stretch",
+                         height=min(700, 50 + len(drill_rows) * 36))
+
+            # Mini sparklines for this industry's stocks
+            st.markdown("##### Sparklines")
+            COLS = 5
+            for i in range(0, len(drill_stocks), COLS):
+                chunk     = sorted(drill_stocks, key=lambda x: x["score"], reverse=True)[i : i + COLS]
+                grid_cols = st.columns(COLS)
+                for gc, s in zip(grid_cols, chunk):
+                    img    = _mini_chart(s.get("_df"))
+                    score  = s["score"]
+                    stage  = s.get("stage", "?")
+                    ret_1m = s.get("ret_1m")
+                    s_icon = "🟢" if score >= 72 else "🔵" if score >= 58 else "🟡" if score >= 42 else "🔴"
+                    st_tag = "✅" if stage == 2 else "⚠️" if stage == 1 else "❌"
+                    ret_str = f"  {ret_1m:+.1f}%" if ret_1m is not None else ""
+                    with gc:
+                        if img:
+                            st.image(img)
+                        st.caption(
+                            f"{s_icon} **{s['ticker']}** {score}/100  \n"
+                            f"S{stage}{st_tag}{ret_str}"
+                        )
+        else:
+            st.info("No stocks found for this selection.")
+
+
+# ── TAB 4: SCREENED STOCKS ────────────────────────────────────────────────────
+with tab4:
     if not stocks:
         st.warning("No candidates passed screening.")
     else:
@@ -489,20 +689,37 @@ with tab3:
         df_sc = pd.DataFrame(rows)
         pct_cols_sc = ["1M%", "3M%", "1Y%", "RS%"]
 
-        styled_sc = (
-            df_sc.style
-            .map(_score_style, subset=["Score"])
-            .map(_stage_style, subset=["Stage"])
-            .map(_pct_style,   subset=pct_cols_sc)
-            .format({c: "{:+.2f}%" for c in pct_cols_sc}, na_rep="–")
-            .format({"P/E": "{:.1f}", "RSI": "{:.0f}"}, na_rep="–")
+        sc_event = st.dataframe(
+            df_sc,
+            width="stretch",
+            height=min(900, 50 + len(rows) * 36),
+            on_select="rerun",
+            selection_mode="single-row",
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score", min_value=0, max_value=100, format="%d /100"
+                ),
+                "1M%": st.column_config.NumberColumn("1M%", format="%.2f%%"),
+                "3M%": st.column_config.NumberColumn("3M%", format="%.2f%%"),
+                "1Y%": st.column_config.NumberColumn("1Y%", format="%.2f%%"),
+                "RS%": st.column_config.NumberColumn("RS%", format="%.2f%%"),
+                "RSI": st.column_config.NumberColumn("RSI", format="%.0f"),
+                "P/E": st.column_config.NumberColumn("P/E", format="%.1f"),
+            },
         )
-
-        st.dataframe(styled_sc, use_container_width=True, height=min(900, 50 + len(rows) * 36))
         st.caption(
             "Score 0–100  ·  Stage S2 = advancing (ideal entry per Weinstein/Prehn)  "
-            "·  RS% = 1Y return relative to S&P 500"
+            "·  RS% = 1Y return relative to S&P 500  ·  **Click a row to open it in Deep Dive ↗**"
         )
+
+        # Handle row click → pre-select in Deep Dive tab
+        sel_rows = (sc_event.selection.rows if sc_event and sc_event.selection else [])
+        if sel_rows:
+            sel_ticker = rows[sel_rows[0]]["Ticker"]
+            st.session_state["deep_dive_ticker"] = sel_ticker
+            st.success(
+                f"**{sel_ticker}** selected — switch to the **🔍 Deep Dive** tab for the full analysis."
+            )
 
         # ── Mini chart gallery ────────────────────────────────────────────────
         st.divider()
@@ -522,15 +739,15 @@ with tab3:
                 ret_str = f"  {ret_1m:+.1f}%" if ret_1m is not None else ""
                 with gc:
                     if img:
-                        st.image(img, use_column_width=True)
+                        st.image(img, width='stretch')
                     st.caption(
                         f"{s_icon} **{s['ticker']}** {score}/100  \n"
                         f"S{stage}{st_tag}{ret_str}"
                     )
 
 
-# ── TAB 4: DEEP DIVE ─────────────────────────────────────────────────────────
-with tab4:
+# ── TAB 5: DEEP DIVE ─────────────────────────────────────────────────────────
+with tab5:
     if not stocks:
         st.info("Run the analysis first.")
         st.stop()
@@ -540,7 +757,15 @@ with tab4:
         f"{s['ticker']}  {(s.get('name') or '')[:30]}  [{s['score']}/100]"
         for s in top_n_stocks
     ]
-    chosen_label = st.selectbox("Select stock", options, index=0)
+    # Default to the ticker clicked in Screened Stocks tab (if any)
+    _presel = st.session_state.get("deep_dive_ticker")
+    _default_idx = 0
+    if _presel:
+        for _i, _s in enumerate(top_n_stocks):
+            if _s["ticker"] == _presel:
+                _default_idx = _i
+                break
+    chosen_label = st.selectbox("Select stock", options, index=_default_idx)
     chosen_idx   = options.index(chosen_label)
     s            = top_n_stocks[chosen_idx]
     ticker       = s["ticker"]
@@ -570,7 +795,7 @@ with tab4:
         st.subheader("📈 Technical Chart")
         chart_b64 = ta_d.get("chart_b64")
         if chart_b64:
-            st.image(base64.b64decode(chart_b64), use_column_width=True)
+            st.image(base64.b64decode(chart_b64))
         else:
             st.warning("Chart unavailable (need ≥50 trading days of data).")
 

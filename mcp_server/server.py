@@ -209,7 +209,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         elif universe_name == "nasdaq":
             tickers = config.NASDAQ_100_SELECTED
         elif universe_name == "custom":
-            tickers = config.CUSTOM_WATCHLIST
+            tickers = config.get_custom_watchlist()
         else:
             tickers = config.get_universe(universe_name)
 

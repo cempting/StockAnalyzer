@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific generated artifacts
+.DS_Store
+assets/.DS_Store
+.vscode/
+
+# Local user state
+data/custom_watchlist.json
+
+# Generated market-data caches
+data/market_cache/
+data/universe_cache.json
+
+# Generated analysis reports
+reports/analysis_*.html
+reports/analysis_*_*.html

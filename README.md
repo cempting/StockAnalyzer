@@ -50,6 +50,8 @@ mcp_server/server.py          → MCP server for Claude Code integration
 | FTSE 100 | LSE – UK blue chips |
 | S&P 500 Top 100 | NYSE/NASDAQ |
 | NASDAQ 100 | NASDAQ |
+| Russell 2000 (selected) | US small-cap representative basket |
+| US Mid Caps (selected) | US mid-cap representative basket |
 | Custom watchlist | Add tickers to `CUSTOM_WATCHLIST` in config.py |
 
 ---
@@ -102,16 +104,55 @@ python run_analysis.py
 # Faster focused run (~5-10 min)
 python run_analysis.py --universe focused
 
+# Simplified max coverage (stocks + tracked ETFs, cache-first)
+python run_analysis.py --universe allassets
+
 # Single market
 python run_analysis.py --universe dax
 python run_analysis.py --universe sp500
 python run_analysis.py --universe nasdaq
+python run_analysis.py --universe russell2000
+python run_analysis.py --universe midcap
+python run_analysis.py --universe largecap
+python run_analysis.py --universe xlargecap
 
 # Your personal watchlist (edit CUSTOM_WATCHLIST in config.py first)
 python run_analysis.py --universe custom
+
+# Analyze your live portfolio (RESTOCK/HOLD/SELL per holding)
+python run_analysis.py --universe xlargecap --portfolio portfolio_example.csv
 ```
 
 The report opens in any browser: `reports/analysis_YYYY-MM-DD.html`
+
+### Portfolio CSV Format
+
+Use a CSV with at least a `Ticker` column:
+
+```csv
+Ticker,Quantity,AverageCost,EntryDate
+AAPL,100,150.00,2025-11-12
+MSFT,50,380.00,2026-01-08
+```
+
+Notes:
+- `Quantity` and `AverageCost` are optional but recommended for P/L and position sizing context.
+- `EntryDate` is optional (`YYYY-MM-DD` preferred) and is used for holding-period-aware decisions.
+- Recommendations are shown as `RESTOCK`, `HOLD`, or `SELL` in the generated HTML report.
+
+### Dynamic Universe Caching
+
+- `russell2000` and `midcap` universes are fetched from public constituent sources when available.
+- Results are cached locally in `data/universe_cache.json`.
+- Cache TTL is 7 days by default and can be changed via `DYNAMIC_UNIVERSE_TTL_HOURS` in `config.py`.
+- If a live fetch fails, the system falls back to the curated static list so runs remain reliable.
+
+### Market Data Caching (Yahoo request reduction)
+
+- OHLCV and fundamental `.info` responses are cached in-memory during each run.
+- A persistent disk cache is also used across runs in `data/market_cache/`.
+- OHLCV disk cache TTL defaults to 6 hours; info cache TTL defaults to 24 hours.
+- Re-running the same universe now reuses local cache first, significantly reducing Yahoo load.
 
 ---
 

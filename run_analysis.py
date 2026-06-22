@@ -6,8 +6,11 @@ Chains all five agents in order and produces a self-contained HTML report.
 Usage:
     python run_analysis.py              # broad universe (default)
     python run_analysis.py --universe focused
+    python run_analysis.py --universe allassets
     python run_analysis.py --universe dax
     python run_analysis.py --universe sp500
+    python run_analysis.py --universe russell2000
+    python run_analysis.py --universe midcap
     python run_analysis.py --universe custom
 """
 
@@ -49,6 +52,7 @@ class AnalysisContext:
     market_phase:    Optional[str] = None
     eu_market_phase: Optional[str] = None
     breadth_signal:  Optional[str] = None
+    market_assessment: Dict[str, Any] = field(default_factory=dict)
     index_data:      Dict[str, Any] = field(default_factory=dict)
     uptrend_count:   int = 0
     total_indices:   int = 0
@@ -64,12 +68,24 @@ class AnalysisContext:
 
     # Filled by Agent 3 – StockScreenerAgent
     screened_stocks: List[Dict[str, Any]] = field(default_factory=list)
+    snapshot_data: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # ticker → {ohlcv, fundamentals}
+
+    # Filled by Agent 3.5 – MoneyFlowAnalystAgent
+    money_flow_analysis: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # ticker → flow metrics
+    sector_flows: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # sector → flow summary
+    industry_flows: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # industry → flow summary
+    entry_opportunities: List[Dict[str, Any]] = field(default_factory=list)  # entry signals by priority
+    exit_risks: List[Dict[str, Any]] = field(default_factory=list)  # all exit risk alerts
+    portfolio_exit_risks: List[Dict[str, Any]] = field(default_factory=list)  # positions to exit
 
     # Filled by Agent 4 – TechnicalAnalystAgent
     technical_analyses: Dict[str, Any] = field(default_factory=dict)
 
     # Filled by Agent 5 – FundamentalAnalystAgent
     fundamental_analyses: Dict[str, Any] = field(default_factory=dict)
+
+    # Filled by Agent 5.5 – PortfolioAnalyzerAgent (optional)
+    portfolio_analysis: List[Dict[str, Any]] = field(default_factory=list)
 
     # Filled by Agent 6 – ReportGeneratorAgent
     report_path: Optional[str] = None
@@ -79,19 +95,23 @@ class AnalysisContext:
 # PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline(universe: str = "broad") -> str:
+def run_pipeline(universe: str = "broad", portfolio_file: Optional[str] = None) -> str:
     """
     Execute the full agent pipeline and return the report file path.
+    If portfolio_file is provided, also analyze user holdings.
     This function is also called by the MCP server's run_full_report tool.
     """
     import config
     from tools.market_data import fetch_ohlcv
+    from tools.market_data import get_cache_summary
     from agents import (
         market_overview,
         sector_rotation,
         stock_screener,
+        money_flow_analyst,
         technical_analyst,
         fundamental_analyst,
+        portfolio_analyzer,
         report_generator,
     )
 
@@ -102,15 +122,9 @@ def run_pipeline(universe: str = "broad") -> str:
         border_style="magenta",
     ))
 
-    # Resolve tickers
-    if universe == "dax":
-        tickers = config.DAX_40
-    elif universe == "sp500":
-        tickers = config.SP500_TOP100
-    elif universe == "nasdaq":
-        tickers = config.NASDAQ_100_SELECTED
-    elif universe == "custom":
-        tickers = config.CUSTOM_WATCHLIST or config.DAX_40
+    # Resolve tickers through one path to keep behavior consistent.
+    if universe == "custom":
+        tickers = config.get_custom_watchlist() or config.DAX_40
     else:
         tickers = config.get_universe(universe)
 
@@ -144,6 +158,27 @@ def run_pipeline(universe: str = "broad") -> str:
     else:
         console.print("  [yellow]No candidates passed screening[/yellow]")
 
+    # ── Agent 3.4 – Portfolio Analyzer (optional) ──────────────────────────────
+    if portfolio_file:
+        console.print(Rule("[bold blue]Agent 3.4 · Portfolio Analyzer[/bold blue]"))
+        portfolio_analyzer.run(ctx, portfolio_file)
+        if ctx.portfolio_analysis:
+            restock = sum(1 for h in ctx.portfolio_analysis if h.get("recommendation") == "RESTOCK")
+            hold = sum(1 for h in ctx.portfolio_analysis if h.get("recommendation") == "HOLD")
+            sell = sum(1 for h in ctx.portfolio_analysis if h.get("recommendation") == "SELL")
+            console.print(
+                f"  Holdings analyzed: {len(ctx.portfolio_analysis)} "
+                f"([green]RESTOCK {restock}[/green], [yellow]HOLD {hold}[/yellow], [red]SELL {sell}[/red])"
+            )
+
+    # ── Agent 3.5 – Money Flow Analyst ────────────────────────────────────────
+    console.print(Rule("[bold blue]Agent 3.5 · Money Flow Analyst[/bold blue]"))
+    money_flow_analyst.run(ctx)
+    if ctx.money_flow_analysis:
+        strong_buys = sum(1 for f in ctx.money_flow_analysis.values() if "STRONG BUY" in f.get("signal", ""))
+        strong_sells = sum(1 for f in ctx.money_flow_analysis.values() if "EXIT" in f.get("signal", ""))
+        console.print(f"  Strong buys: [green]{strong_buys}[/green], Strong sells: [red]{strong_sells}[/red]")
+
     # ── Agent 4 ───────────────────────────────────────────────────────────────
     console.print(Rule("[bold blue]Agent 4 · Technical Analyst[/bold blue]"))
     technical_analyst.run(ctx)
@@ -158,6 +193,15 @@ def run_pipeline(universe: str = "broad") -> str:
     console.print(Rule("[bold blue]Agent 6 · Report Generator[/bold blue]"))
     report_path = report_generator.run(ctx)
     ctx.report_path = report_path
+
+    cache_summary = get_cache_summary()
+    ohlcv_cache = cache_summary.get("ohlcv", {})
+    info_cache = cache_summary.get("info", {})
+    console.print(
+        f"  Cache: OHLCV hit {ohlcv_cache.get('hit_rate_pct', 0.0):.1f}% "
+        f"({ohlcv_cache.get('hits', 0)} hits / {ohlcv_cache.get('yahoo_requests', 0)} Yahoo req) · "
+        f"Info hit {info_cache.get('hit_rate_pct', 0.0):.1f}%"
+    )
 
     elapsed = round(time.time() - t0, 1)
     console.print(Panel(
@@ -178,14 +222,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--universe",
         default="broad",
-        choices=["focused", "broad", "dax", "sp500", "nasdaq", "custom"],
+        choices=["focused", "broad", "allassets", "dax", "sp500", "nasdaq", "russell2000", "midcap", "largecap", "xlargecap", "custom"],
         help="Stock universe to analyse (default: broad)",
+    )
+    parser.add_argument(
+        "--portfolio",
+        type=str,
+        default=None,
+        help="Path to portfolio CSV (Ticker, Quantity, AverageCost, optional EntryDate) for RESTOCK/HOLD/SELL analysis",
     )
     args = parser.parse_args()
 
     # Change to the script's directory so relative paths (reports/, data/) work
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    report = run_pipeline(universe=args.universe)
+    report = run_pipeline(universe=args.universe, portfolio_file=args.portfolio)
     print(f"\n  Report saved → {report}")
     print("  Open it in any browser.\n")
+    if args.portfolio:
+        print(f"  Portfolio analyzed from: {args.portfolio}")

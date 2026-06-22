@@ -53,6 +53,11 @@ def extract_fundamentals(info: Dict[str, Any]) -> Dict[str, Any]:
     market_cap   = _safe_float(get("marketCap"))
     beta         = _safe_float(get("beta"))
     dividend_yield = _safe_float(get("dividendYield"))
+    total_cash   = _safe_float(get("totalCash"))
+    free_cashflow = _safe_float(get("freeCashflow"))
+    operating_cashflow = _safe_float(get("operatingCashflow"))
+    held_pct_inst = _safe_float(get("heldPercentInstitutions"))
+    held_pct_ins = _safe_float(get("heldPercentInsiders"))
 
     # Identity
     name         = get("shortName") or get("longName") or ""
@@ -105,6 +110,11 @@ def extract_fundamentals(info: Dict[str, Any]) -> Dict[str, Any]:
         "market_cap":      market_cap,
         "beta":            beta,
         "dividend_yield":  dividend_yield,
+        "total_cash":      total_cash,
+        "free_cashflow":   free_cashflow,
+        "operating_cashflow": operating_cashflow,
+        "held_percent_institutions": held_pct_inst,
+        "held_percent_insiders": held_pct_ins,
     }
 
 
@@ -306,3 +316,112 @@ def _stage_label(stage: int) -> str:
     labels = {1: "Stage 1 – Basing", 2: "Stage 2 – Advancing ✓",
               3: "Stage 3 – Topping", 4: "Stage 4 – Declining"}
     return labels.get(stage, "Stage unknown")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THREE-FILTER SINGLE-STOCK ASSESSMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def assess_single_stock_filters(fund: Dict[str, Any], profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Evaluate a stock with a practical 3-filter overlay:
+      1) Cash runway / self-funding profile
+      2) Institutional support
+      3) Revenue quality (growth + margin/earnings confirmation)
+
+    Returns a score from 0-9 and a qualitative rating.
+    """
+    profile = profile or {}
+    runway_levels = profile.get("runway_months", [6, 12, 24])
+    inst_levels = profile.get("institutional_levels", [0.20, 0.35, 0.60])
+    rev_levels = profile.get("revenue_growth_levels", [0.00, 0.10, 0.20])
+    gross_margin_strong = profile.get("gross_margin_strong", 0.40)
+
+    runway_months = _cash_runway_months(fund)
+    inst = fund.get("held_percent_institutions")
+    insider = fund.get("held_percent_insiders")
+    rev_growth = fund.get("revenue_growth")
+    eps_growth = fund.get("earnings_growth")
+    gross_margin = fund.get("gross_margins")
+
+    # Filter 1: Cash runway / survivability
+    if runway_months is None:
+        cash_pts, cash_label = 1, "Cash runway unavailable"
+    elif runway_months >= runway_levels[2]:
+        cash_pts, cash_label = 3, f"Cash runway {runway_months:.0f}m (strong)"
+    elif runway_months >= runway_levels[1]:
+        cash_pts, cash_label = 2, f"Cash runway {runway_months:.0f}m (acceptable)"
+    elif runway_months >= runway_levels[0]:
+        cash_pts, cash_label = 1, f"Cash runway {runway_months:.0f}m (tight)"
+    else:
+        cash_pts, cash_label = 0, f"Cash runway {runway_months:.0f}m (fragile)"
+
+    # Filter 2: Institutional support
+    if inst is None:
+        inst_pts, inst_label = 1, "Institutional ownership unavailable"
+    elif inst >= inst_levels[2] and (insider is None or insider < 0.30):
+        inst_pts, inst_label = 3, f"Institutional ownership {inst*100:.0f}% (strong)"
+    elif inst >= inst_levels[1]:
+        inst_pts, inst_label = 2, f"Institutional ownership {inst*100:.0f}% (solid)"
+    elif inst >= inst_levels[0]:
+        inst_pts, inst_label = 1, f"Institutional ownership {inst*100:.0f}% (developing)"
+    else:
+        inst_pts, inst_label = 0, f"Institutional ownership {inst*100:.0f}% (weak)"
+
+    # Filter 3: Revenue quality / inflection proxy
+    if rev_growth is None:
+        rev_pts, rev_label = 1, "Revenue quality unavailable"
+    elif rev_growth >= rev_levels[2] and (eps_growth is None or eps_growth >= 0) and (gross_margin is None or gross_margin >= gross_margin_strong):
+        rev_pts, rev_label = 3, f"Revenue quality strong ({rev_growth*100:.0f}% YoY)"
+    elif rev_growth >= rev_levels[1] and (eps_growth is None or eps_growth >= 0):
+        rev_pts, rev_label = 2, f"Revenue quality improving ({rev_growth*100:.0f}% YoY)"
+    elif rev_growth >= rev_levels[0]:
+        rev_pts, rev_label = 1, f"Revenue growth positive but low ({rev_growth*100:.0f}% YoY)"
+    else:
+        rev_pts, rev_label = 0, f"Revenue contraction ({rev_growth*100:.0f}% YoY)"
+
+    total = cash_pts + inst_pts + rev_pts
+    if total >= 7:
+        rating = "PASS"
+    elif total >= 4:
+        rating = "WATCH"
+    else:
+        rating = "FAIL"
+
+    return {
+        "score": total,
+        "max_score": 9,
+        "rating": rating,
+        "cash_runway_months": runway_months,
+        "checks": {
+            "cash_runway": {"points": cash_pts, "label": cash_label},
+            "institutional_support": {"points": inst_pts, "label": inst_label},
+            "revenue_quality": {"points": rev_pts, "label": rev_label},
+        },
+    }
+
+
+def _cash_runway_months(fund: Dict[str, Any]) -> Optional[float]:
+    """
+    Estimate months of runway from total cash and annual cash-flow figures.
+    Returns None when data is insufficient.
+    """
+    total_cash = fund.get("total_cash")
+    if total_cash is None or total_cash <= 0:
+        return None
+
+    # Prefer free cash flow, then operating cash flow.
+    # Positive annual cash flow implies self-funded operations.
+    annual_cf = fund.get("free_cashflow")
+    if annual_cf is None:
+        annual_cf = fund.get("operating_cashflow")
+    if annual_cf is None:
+        return None
+
+    if annual_cf >= 0:
+        return 120.0
+
+    monthly_burn = abs(annual_cf) / 12.0
+    if monthly_burn == 0:
+        return None
+    return total_cash / monthly_burn

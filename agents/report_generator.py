@@ -120,6 +120,44 @@ def _bar_chart_b64(labels, values, colors, title, xlabel="") -> Optional[str]:
     return b64
 
 
+def _glossary_section() -> str:
+    """Human-readable definitions for report abbreviations and stage labels."""
+    return """
+<section>
+  <h2>📚 Abbreviations & Stage Guide</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Abbreviation</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>1D, 1W, 1M, 3M, 6M, 1Y</td><td>Price return over 1 day, week, month, 3 months, 6 months, and 1 year.</td></tr>
+          <tr><td>YTD</td><td>Year-to-date return (from start of current year).</td></tr>
+          <tr><td>MA50, MA150, MA200</td><td>50/150/200-day moving average; trend baselines used for direction and support.</td></tr>
+          <tr><td>RS</td><td>Relative Strength versus S&amp;P 500 over the configured lookback.</td></tr>
+          <tr><td>RSI</td><td>Relative Strength Index momentum oscillator (0-100).</td></tr>
+          <tr><td>P/E</td><td>Price-to-Earnings ratio (valuation multiple).</td></tr>
+          <tr><td>EPS</td><td>Earnings Per Share.</td></tr>
+          <tr><td>EPS↑</td><td>EPS growth rate; upward arrow indicates growth metric.</td></tr>
+          <tr><td>ROE</td><td>Return on Equity (profitability versus shareholder equity).</td></tr>
+          <tr><td>3F</td><td>Three-filter overlay: cash runway, institutional support, and revenue quality.</td></tr>
+          <tr><td>TA / FA</td><td>Technical Analysis / Fundamental Analysis.</td></tr>
+          <tr><td>US / EU</td><td>United States / Europe market scope in this report.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div style="background:var(--surface);border:1px solid var(--surface2);border-radius:10px;padding:14px">
+      <p><strong>Weinstein Stages (S1-S4)</strong></p>
+      <p><strong>S1 - Basing:</strong> Sideways consolidation; trend not yet confirmed.</p>
+      <p><strong>S2 - Advancing:</strong> Price above a rising long moving average; primary uptrend.</p>
+      <p><strong>S3 - Topping:</strong> Uptrend loses momentum; range forms, risk of reversal rises.</p>
+      <p><strong>S4 - Declining:</strong> Price below a falling long moving average; downtrend.</p>
+      <p style="color:var(--subtext);margin-top:8px">In this system, S2 is preferred for long setups; S3/S4 are generally avoided for new long entries.</p>
+    </div>
+  </div>
+</section>
+"""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PORTFOLIO SECTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,6 +557,7 @@ def _render(ctx: "AnalysisContext", date_str: str) -> str:
   .table-wrap {{ overflow-x: auto; border-radius: 8px; border: 1px solid var(--surface); }}
   .metrics-table {{ font-size: 12px; }}
   .metrics-table th {{ background: #181825; }}
+  th[title] {{ cursor: help; }}
   .stock-detail {{ background: var(--surface); border-radius: 12px; padding: 24px;
                    margin-bottom: 30px; border: 1px solid var(--surface2); }}
   .stock-header h2 {{ border: none; font-size: 18px; padding: 0; margin-bottom: 4px; }}
@@ -565,8 +604,15 @@ def _render(ctx: "AnalysisContext", date_str: str) -> str:
   <div class="table-wrap" style="margin-top:16px">
     <table>
       <thead><tr>
-        <th>Index</th><th>Last</th><th>1D</th><th>1W</th>
-        <th>1M</th><th>YTD</th><th>1Y</th><th>MA200</th><th>MA50</th>
+        <th title="Index or benchmark symbol being tracked">Index</th>
+        <th title="Latest close price">Last</th>
+        <th title="1-day price return">1D</th>
+        <th title="1-week price return">1W</th>
+        <th title="1-month price return">1M</th>
+        <th title="Year-to-date return">YTD</th>
+        <th title="1-year price return">1Y</th>
+        <th title="Above 200-day moving average (trend filter)">MA200</th>
+        <th title="Above 50-day moving average (shorter trend filter)">MA50</th>
       </tr></thead>
       <tbody>{idx_rows}</tbody>
     </table>
@@ -619,6 +665,8 @@ def _render(ctx: "AnalysisContext", date_str: str) -> str:
   </div>
 </section>
 
+{_glossary_section()}
+
 <!-- ── 4. Screened Candidates ─────────────────────────────────────── -->
 <section>
   <h2>🎯 Screened Candidates (Felix Prehn Score)</h2>
@@ -626,9 +674,21 @@ def _render(ctx: "AnalysisContext", date_str: str) -> str:
   <div class="table-wrap" style="margin-top:16px">
     <table>
       <thead><tr>
-        <th>Ticker</th><th>Name</th><th>Sector</th><th>Score</th>
-        <th>Blended</th><th>3F</th><th>Stage</th><th>1M</th><th>3M</th><th>1Y</th>
-        <th>RS</th><th>RSI</th><th>P/E</th><th>EPS↑</th><th>Rating</th>
+        <th title="Ticker symbol">Ticker</th>
+        <th title="Company name">Name</th>
+        <th title="Primary business sector">Sector</th>
+        <th title="Felix Prehn base score (0-100)">Score</th>
+        <th title="Blended score = Prehn score + 3-filter overlay weighting">Blended</th>
+        <th title="3-filter overlay: cash runway, institutional support, revenue quality">3F</th>
+        <th title="Weinstein stage: S1 basing, S2 advancing, S3 topping, S4 declining">Stage</th>
+        <th title="1-month price return">1M</th>
+        <th title="3-month price return">3M</th>
+        <th title="1-year price return">1Y</th>
+        <th title="Relative strength versus S&P 500">RS</th>
+        <th title="Relative Strength Index momentum oscillator (0-100)">RSI</th>
+        <th title="Price-to-Earnings ratio">P/E</th>
+        <th title="Earnings-per-share growth">EPS↑</th>
+        <th title="Model rating bucket">Rating</th>
       </tr></thead>
       <tbody>{stock_rows}</tbody>
     </table>

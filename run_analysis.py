@@ -4,14 +4,11 @@ run_analysis.py – Weekend Market Analysis Orchestrator
 Chains all five agents in order and produces a self-contained HTML report.
 
 Usage:
-    python run_analysis.py              # broad universe (default)
-    python run_analysis.py --universe focused
-    python run_analysis.py --universe allassets
-    python run_analysis.py --universe dax
-    python run_analysis.py --universe sp500
-    python run_analysis.py --universe russell2000
+    python run_analysis.py                          # large caps (default)
+    python run_analysis.py --universe largecap
     python run_analysis.py --universe midcap
-    python run_analysis.py --universe custom
+    python run_analysis.py --universe smallcap
+    python run_analysis.py --depth 200
 """
 
 import argparse
@@ -95,7 +92,7 @@ class AnalysisContext:
 # PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline(universe: str = "broad", portfolio_file: Optional[str] = None) -> str:
+def run_pipeline(universe: str = "largecap", portfolio_file: Optional[str] = None, depth: int = 40) -> str:
     """
     Execute the full agent pipeline and return the report file path.
     If portfolio_file is provided, also analyze user holdings.
@@ -115,10 +112,17 @@ def run_pipeline(universe: str = "broad", portfolio_file: Optional[str] = None) 
         report_generator,
     )
 
+    # Clamp user-provided depth to a safe upper bound.
+    depth = max(1, min(int(depth), 500))
+
+    # Apply depth consistently across screener and deep-analysis stages.
+    config.SCREENING["max_candidates"] = depth
+    config.MAX_DETAIL_STOCKS = depth
+
     t0 = time.time()
     console.print(Panel(
         f"[bold magenta]Felix Prehn Weekend Analysis[/bold magenta]\n"
-        f"[dim]Universe: {universe.upper()}  ·  {pd.Timestamp.now().strftime('%A %d %B %Y')}[/dim]",
+        f"[dim]Universe: {universe.upper()}  ·  Depth: {depth}  ·  {pd.Timestamp.now().strftime('%A %d %B %Y')}[/dim]",
         border_style="magenta",
     ))
 
@@ -221,9 +225,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Felix Prehn Weekend Market Analysis")
     parser.add_argument(
         "--universe",
-        default="broad",
-        choices=["focused", "broad", "allassets", "dax", "sp500", "nasdaq", "russell2000", "midcap", "largecap", "xlargecap", "custom"],
-        help="Stock universe to analyse (default: broad)",
+        default="largecap",
+        choices=["smallcap", "midcap", "largecap"],
+        help="Stock universe to analyse (default: largecap)",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=40,
+        help="Analysis depth (1-500). Controls screening and deep-analysis count.",
     )
     parser.add_argument(
         "--portfolio",
@@ -236,7 +246,7 @@ if __name__ == "__main__":
     # Change to the script's directory so relative paths (reports/, data/) work
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    report = run_pipeline(universe=args.universe, portfolio_file=args.portfolio)
+    report = run_pipeline(universe=args.universe, portfolio_file=args.portfolio, depth=args.depth)
     print(f"\n  Report saved → {report}")
     print("  Open it in any browser.\n")
     if args.portfolio:

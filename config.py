@@ -240,6 +240,14 @@ UNIVERSES = {
               RUSSELL_2000_SELECTED + US_MIDCAP_SELECTED),
 }
 
+# Canonical universe aliases used by the simplified run-analysis UX.
+# Keep legacy names mapped for backward compatibility.
+UNIVERSE_ALIASES = {
+    "small": "russell2000",
+    "mid": "midcap",
+    "large": "largecap",
+}
+
 # Dynamic universe cache settings
 DYNAMIC_UNIVERSE_TTL_HOURS = 24 * 7
 
@@ -300,6 +308,7 @@ def _get_all_assets_universe() -> list:
 
 def get_universe(name: str = "broad") -> list:
     name = (name or "broad").strip().lower()
+    name = UNIVERSE_ALIASES.get(name, name)
     custom_watchlist = get_custom_watchlist()
 
     if name in ("all", "allassets"):
@@ -512,6 +521,7 @@ UNIVERSE_CALIBRATION = {
 
 def get_universe_calibration(universe_name: str) -> dict:
     """Return merged calibration profile for a given universe name."""
+    universe_name = UNIVERSE_ALIASES.get((universe_name or "").strip().lower(), universe_name)
     base = dict(UNIVERSE_CALIBRATION.get("default", {}))
     override = UNIVERSE_CALIBRATION.get(universe_name, {})
 

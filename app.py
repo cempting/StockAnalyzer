@@ -430,9 +430,9 @@ with st.sidebar:
 
     universe = st.selectbox(
         "Universe",
-        ["focused", "broad", "allassets", "dax", "sp500", "nasdaq", "russell2000", "midcap", "largecap", "xlargecap", "custom"],
+        ["largecap", "midcap", "smallcap"],
         index=0,
-        help="focused ~150 tickers · broad ~700+ · allassets adds tracked ETFs and dynamic constituents",
+        help="Select a US market-cap bucket only: large, mid, or small caps.",
     )
 
     watchlist_input = st.text_area(
@@ -460,7 +460,9 @@ with st.sidebar:
 
     max_detail = st.slider(
         "Stocks to deep-analyse",
-        min_value=5, max_value=40, value=config.MAX_DETAIL_STOCKS,
+        min_value=5,
+        max_value=500,
+        value=min(max(config.MAX_DETAIL_STOCKS, 5), 500),
         help="Top N candidates get full TA chart + FA breakdown",
     )
 
@@ -492,14 +494,13 @@ if run_btn:
     custom_tickers = _parse_tickers(custom_input)
     saved_watchlist = config.get_custom_watchlist()
 
-    if universe == "custom":
-        base_tickers = saved_watchlist or config.DAX_40
-    else:
-        base_tickers = config.get_universe(universe)
+    base_tickers = config.get_universe(universe)
     all_tickers  = list(dict.fromkeys(base_tickers + custom_tickers))
 
-    # Propagate UI slider to config so all agents respect it
-    config.MAX_DETAIL_STOCKS = max_detail
+    # Propagate UI depth to both screener and deep-analysis stages.
+    depth = max(1, min(int(max_detail), 500))
+    config.SCREENING["max_candidates"] = depth
+    config.MAX_DETAIL_STOCKS = depth
 
     ctx = AnalysisContext(universe_name=universe, universe_tickers=all_tickers)
 
@@ -552,8 +553,8 @@ if run_btn:
 if "ctx" not in st.session_state:
     st.title("📊 Felix Prehn Weekend Market Analyzer")
     st.markdown(
-        "Select a **universe** in the sidebar and click **🚀 Run Analysis** to launch the "
-        "5-agent pipeline across all markets tradeable from Germany."
+        "Select a **market-cap universe** in the sidebar (large, mid, or small caps) and "
+        "click **🚀 Run Analysis** to launch the 5-agent pipeline."
     )
     st.divider()
 
@@ -563,16 +564,9 @@ if "ctx" not in st.session_state:
         st.markdown("""
 | Universe | Exchanges |
 |---|---|
-| DAX 40 | XETRA – German large caps |
-| MDAX | XETRA – German mid caps |
-| Euro Stoxx ex-DE | Amsterdam · Paris · Madrid · Milan |
-| Swiss | SIX (NESN, NOVN, ROG…) |
-| FTSE 100 | London Stock Exchange |
-| S&P 500 Top 100 | NYSE / NASDAQ |
-| NASDAQ 100 | NASDAQ |
-| Russell 2000 (selected) | US small caps |
-| US Mid Caps (selected) | US mid-cap leaders |
-| Custom | Your own tickers |
+| Large Cap | US large-cap universe |
+| Mid Cap | US mid-cap universe |
+| Small Cap | US small-cap universe |
         """)
 
     with col_r:
@@ -645,6 +639,36 @@ k4.metric("🎯 Candidates", len(stocks))
 k5.metric("🏆 Top Score", f"{stocks[0]['score']}/100" if stocks else "–")
 k6.metric("💧 Liquidity Confidence", f"{_liq_conf_score}/100", _liq_conf_label)
 st.divider()
+
+with st.expander("📚 Abbreviations & Stage Guide", expanded=False):
+    st.markdown(
+        """
+        **Returns**: 1D, 1W, 1M, 3M, 6M, 1Y = return over 1 day/week/month/3 months/6 months/1 year.  
+        **YTD** = year-to-date return.
+
+        **Trend/Momentum**:  
+        **MA50 / MA150 / MA200** = 50/150/200-day moving average.  
+        **RS** = relative strength vs S&P 500.  
+        **RSI** = Relative Strength Index (0-100).  
+        **MACD** = moving average convergence/divergence momentum signal.
+
+        **Fundamentals**:  
+        **P/E** = price-to-earnings ratio.  
+        **EPS** = earnings per share.  
+        **EPS↑** = EPS growth metric.  
+        **ROE** = return on equity.
+
+        **Other labels**:  
+        **3F** = three-filter overlay (cash runway, institutional support, revenue quality).  
+        **TA / FA** = technical analysis / fundamental analysis.
+
+        **Weinstein Stage model**:  
+        **S1 (Basing)** = sideways consolidation.  
+        **S2 (Advancing)** = price above rising long MA (preferred for long setups).  
+        **S3 (Topping)** = trend plateauing, higher reversal risk.  
+        **S4 (Declining)** = price below falling long MA (downtrend).
+        """
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -880,11 +904,37 @@ with tab3:
                     help="Main reasons this stock ranks high in current liquidity conditions",
                     width="large",
                 ),
-                "Liquidity": st.column_config.ProgressColumn("Liquidity", min_value=0, max_value=100, format="%.1f /100"),
-                "Prehn": st.column_config.NumberColumn("Prehn", format="%.0f"),
-                "1M%": st.column_config.NumberColumn("1M%", format="%.2f%%"),
-                "3M%": st.column_config.NumberColumn("3M%", format="%.2f%%"),
-                "RS%": st.column_config.NumberColumn("RS%", format="%.2f%%"),
+                "Liquidity": st.column_config.ProgressColumn(
+                    "Liquidity",
+                    help="Composite liquidity-shift score (0-100): sector flow alignment + stock quality + trend context.",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f /100",
+                ),
+                "Prehn": st.column_config.NumberColumn(
+                    "Prehn",
+                    help="Base Felix Prehn stock score before liquidity overlay.",
+                    format="%.0f",
+                ),
+                "Stage": st.column_config.TextColumn(
+                    "Stage",
+                    help="Weinstein stage label (S1 basing, S2 advancing, S3 topping, S4 declining).",
+                ),
+                "1M%": st.column_config.NumberColumn(
+                    "1M%",
+                    help="1-month price return.",
+                    format="%.2f%%",
+                ),
+                "3M%": st.column_config.NumberColumn(
+                    "3M%",
+                    help="3-month price return.",
+                    format="%.2f%%",
+                ),
+                "RS%": st.column_config.NumberColumn(
+                    "RS%",
+                    help="Relative strength versus S&P 500.",
+                    format="%.2f%%",
+                ),
             },
         )
         st.caption(
@@ -1118,14 +1168,50 @@ with tab5:
             selection_mode="single-row",
             column_config={
                 "Score": st.column_config.ProgressColumn(
-                    "Score", min_value=0, max_value=100, format="%d /100"
+                    "Score",
+                    help="Felix Prehn model score (0-100).",
+                    min_value=0,
+                    max_value=100,
+                    format="%d /100",
                 ),
-                "1M%": st.column_config.NumberColumn("1M%", format="%.2f%%"),
-                "3M%": st.column_config.NumberColumn("3M%", format="%.2f%%"),
-                "1Y%": st.column_config.NumberColumn("1Y%", format="%.2f%%"),
-                "RS%": st.column_config.NumberColumn("RS%", format="%.2f%%"),
-                "RSI": st.column_config.NumberColumn("RSI", format="%.0f"),
-                "P/E": st.column_config.NumberColumn("P/E", format="%.1f"),
+                "Stage": st.column_config.TextColumn(
+                    "Stage",
+                    help="Weinstein stage label (S1 basing, S2 advancing, S3 topping, S4 declining).",
+                ),
+                "1M%": st.column_config.NumberColumn(
+                    "1M%",
+                    help="1-month price return.",
+                    format="%.2f%%",
+                ),
+                "3M%": st.column_config.NumberColumn(
+                    "3M%",
+                    help="3-month price return.",
+                    format="%.2f%%",
+                ),
+                "1Y%": st.column_config.NumberColumn(
+                    "1Y%",
+                    help="1-year price return.",
+                    format="%.2f%%",
+                ),
+                "RS%": st.column_config.NumberColumn(
+                    "RS%",
+                    help="Relative strength versus S&P 500.",
+                    format="%.2f%%",
+                ),
+                "RSI": st.column_config.NumberColumn(
+                    "RSI",
+                    help="Relative Strength Index momentum oscillator (0-100).",
+                    format="%.0f",
+                ),
+                "P/E": st.column_config.NumberColumn(
+                    "P/E",
+                    help="Price-to-earnings ratio.",
+                    format="%.1f",
+                ),
+                "EPS↑": st.column_config.TextColumn(
+                    "EPS↑",
+                    help="Earnings per share growth rate.",
+                ),
             },
         )
         st.caption(

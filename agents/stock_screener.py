@@ -142,6 +142,9 @@ def run(ctx: "AnalysisContext") -> None:
     # Sort by blended rank (Prehn technical/fundamental score + three-filter overlay)
     scored.sort(key=lambda x: (x.get("blended_score", x["score"]), x["score"]), reverse=True)
 
+    # Keep full scored universe for downstream hierarchical selectors in the app.
+    ctx.all_scored_stocks = scored
+
     ctx.screened_stocks = scored[: config.SCREENING["max_candidates"]]
     
     # Also save full snapshot data for use by portfolio analyzer and others

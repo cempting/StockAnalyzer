@@ -8,7 +8,7 @@ import os
 import re
 import sys
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, Hashable, List, Optional, Set, Tuple, cast
 
 import io
 import matplotlib
@@ -193,7 +193,8 @@ def _classify_flow_state(momentum_score: Optional[float], ret_1w: Optional[float
     return "Neutral"
 
 
-def _flow_state_style(val: str) -> str:
+def _flow_state_style(val: object) -> str:
+    sval = str(val)
     palette = {
         "Inflow Accelerating": "background-color:#0d2b0d;color:#2da44e;font-weight:bold",
         "Inflow": "color:#2da44e;font-weight:bold",
@@ -202,7 +203,7 @@ def _flow_state_style(val: str) -> str:
         "Outflow": "color:#cf222e;font-weight:bold",
         "Neutral": "color:#94a3b8",
     }
-    return palette.get(str(val), "")
+    return palette.get(sval, "")
 
 
 def _build_sector_flow_table(ctx: AnalysisContext) -> pd.DataFrame:
@@ -220,7 +221,7 @@ def _build_sector_flow_table(ctx: AnalysisContext) -> pd.DataFrame:
             rows.append({
                 "Region": region,
                 "Sector": sector_name,
-                "Canonical": _normalize_sector_name(sector_name),
+                "Canonical": _normalize_sector_name(str(sector_name)),
                 "1W%": r1w,
                 "1M%": r1m,
                 "3M%": row.get("3mo"),
@@ -239,8 +240,17 @@ def _build_sector_flow_table(ctx: AnalysisContext) -> pd.DataFrame:
     return out
 
 
-def _build_liquidity_winners(stocks: List[dict], flow_df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
-    """Rank screened stocks by score + sector flow alignment."""
+def _build_liquidity_winners(
+    stocks: List[dict],
+    flow_df: pd.DataFrame,
+    top_n: int = 20,
+    early_bias_mode: str = "Balanced",
+) -> pd.DataFrame:
+    """Rank screened stocks by liquidity inflow + upside-left profile.
+
+    Intention: prefer names attracting fresh liquidity that are not already
+    overly extended in price, while still allowing true leaders to rank.
+    """
     if not stocks:
         return pd.DataFrame()
 
@@ -260,6 +270,28 @@ def _build_liquidity_winners(stocks: List[dict], flow_df: pd.DataFrame, top_n: i
             .tolist()
         )
 
+    bias_presets = {
+        "Conservative": {
+            "potential_mult": 0.85,
+            "extension_mult": 1.25,
+            "flow_mult": 0.95,
+            "trend_mult": 0.90,
+        },
+        "Balanced": {
+            "potential_mult": 1.00,
+            "extension_mult": 1.00,
+            "flow_mult": 1.00,
+            "trend_mult": 1.00,
+        },
+        "Aggressive": {
+            "potential_mult": 1.30,
+            "extension_mult": 0.75,
+            "flow_mult": 1.10,
+            "trend_mult": 1.15,
+        },
+    }
+    bias = bias_presets.get(early_bias_mode, bias_presets["Balanced"])
+
     rows = []
     for s in stocks:
         canonical = _normalize_sector_name(s.get("sector") or "")
@@ -269,15 +301,62 @@ def _build_liquidity_winners(stocks: List[dict], flow_df: pd.DataFrame, top_n: i
         prehn = float(s.get("score") or 0.0)
         rs = float(s.get("rs_bench") or 0.0)
         ret_3m = float(s.get("ret_3m") or 0.0)
+        ret_1m = float(s.get("ret_1m") or 0.0)
         stage = int(s.get("stage") or 0)
+        rsi = float(s.get("rsi") or 0.0)
+        pct_52h = s.get("pct_52h")
+        pct_52h = float(pct_52h) if pct_52h is not None and not pd.isna(pct_52h) else None
 
-        stage_bonus = 8 if stage == 2 else 3 if stage == 1 else -4
+        volume_spike = _recent_volume_spike(s.get("_df"))
+
+        # Stage 1 and early Stage 2 get preference for "more upside left".
+        stage_bonus = 8 if stage == 1 else 6 if stage == 2 else -5
         sector_bonus = 10 if canonical in top_inflow else 0
+
+        flow_bonus = 0
+        if flow_state == "Inflow Accelerating":
+            flow_bonus = 8
+        elif flow_state == "Inflow":
+            flow_bonus = 5
+        elif flow_state == "Inflow Cooling":
+            flow_bonus = 2
+        flow_bonus *= bias["flow_mult"]
+
+        # Potential bonuses reward constructive, not-yet-overextended trajectories.
+        potential_bonus = 0.0
+        if -2.0 <= ret_1m <= 12.0:
+            potential_bonus += 6.0
+        if 0.0 <= ret_3m <= 28.0:
+            potential_bonus += 7.0
+        if pct_52h is not None and -35.0 <= pct_52h <= -8.0:
+            potential_bonus += 6.0
+        if volume_spike:
+            potential_bonus += 4.0
+        potential_bonus *= bias["potential_mult"]
+
+        # Extension penalty tempers rankings for names that may already be crowded.
+        extension_penalty = 0.0
+        if ret_1m > 15.0:
+            extension_penalty += min(15.0, (ret_1m - 15.0) * 0.8)
+        if ret_3m > 45.0:
+            extension_penalty += min(20.0, (ret_3m - 45.0) * 0.5)
+        if rsi > 72.0:
+            extension_penalty += min(10.0, (rsi - 72.0) * 1.2)
+        if pct_52h is not None and pct_52h > -5.0:
+            extension_penalty += 5.0
+        extension_penalty *= bias["extension_mult"]
 
         liquidity_score = round(
             max(0.0, min(
                 100.0,
-                prehn * 0.62 + sec_mom * 1.4 + rs * 0.22 + ret_3m * 0.16 + stage_bonus + sector_bonus,
+                prehn * 0.46
+                + sec_mom * 1.75
+                + max(rs, 0.0) * (0.20 * bias["trend_mult"])
+                + stage_bonus
+                + sector_bonus
+                + flow_bonus
+                + potential_bonus
+                - extension_penalty,
             )),
             1,
         )
@@ -285,24 +364,40 @@ def _build_liquidity_winners(stocks: List[dict], flow_df: pd.DataFrame, top_n: i
         reasons = []
         if canonical in top_inflow:
             reasons.append("inflow sector")
+        if flow_state in ("Inflow Accelerating", "Inflow"):
+            reasons.append(flow_state.lower())
         if stage == 2:
             reasons.append("Stage 2")
         elif stage == 1:
             reasons.append("early base")
         if rs > 0:
             reasons.append("RS > 0")
-        if ret_3m > 0:
+        if ret_1m > 0:
+            reasons.append("1M momentum")
+        if 0 < ret_3m <= 28:
             reasons.append("3M momentum")
-        if flow_state in ("Inflow Accelerating", "Inflow"):
-            reasons.append(flow_state.lower())
+        if volume_spike:
+            reasons.append("fresh volume")
+        if pct_52h is not None and -35 <= pct_52h <= -8:
+            reasons.append("upside left vs 52W high")
         if prehn >= 72:
             reasons.append("strong quality")
         why_text = " + ".join(reasons[:4]) if reasons else "watchlist candidate"
+
+        risk_notes = []
+        if extension_penalty >= 8:
+            risk_notes.append("extended")
+        if stage in (3, 4):
+            risk_notes.append("late stage")
+        if rs <= 0:
+            risk_notes.append("weak RS")
+        risk_text = " | ".join(risk_notes[:2]) if risk_notes else "balanced setup"
 
         rows.append({
             "Ticker": s.get("ticker"),
             "Name": (s.get("name") or "")[:30],
             "Why": why_text,
+            "Risk": risk_text,
             "Sector": s.get("sector") or "",
             "Flow Sector": canonical,
             "Flow State": flow_state,
@@ -322,6 +417,398 @@ def _build_liquidity_winners(stocks: List[dict], flow_df: pd.DataFrame, top_n: i
     return df.sort_values(["Liquidity", "Prehn"], ascending=False).head(top_n).reset_index(drop=True)
 
 
+def _flow_context_maps(flow_df: pd.DataFrame) -> Tuple[Set[str], Dict[str, str]]:
+    """Return top-inflow sectors and latest flow-state per canonical sector."""
+    top_inflow: Set[str] = set()
+    flow_state_by_sector: Dict[str, str] = {}
+    if flow_df is None or flow_df.empty:
+        return top_inflow, flow_state_by_sector
+
+    top_inflow = set(
+        flow_df.loc[flow_df["Momentum"] > 0]
+        .sort_values("Momentum", ascending=False)
+        .head(5)["Canonical"]
+        .tolist()
+    )
+
+    for canonical, grp in flow_df.groupby("Canonical"):
+        row = grp.sort_values("Momentum", ascending=False).iloc[0]
+        flow_state_by_sector[str(canonical)] = str(row.get("Flow State") or "Neutral")
+
+    return top_inflow, flow_state_by_sector
+
+
+def _recent_volume_spike(df: Optional[pd.DataFrame], lookback: int = 20, multiple: float = 3.0) -> bool:
+    """Proxy for institutional attention used by several strategy playbooks."""
+    if df is None or df.empty or len(df) < lookback + 5:
+        return False
+    if "Volume" not in df.columns or "Close" not in df.columns:
+        return False
+
+    vol = pd.to_numeric(df["Volume"], errors="coerce")
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    if vol.isna().all() or close.isna().all():
+        return False
+
+    recent = vol.iloc[-(lookback + 1):-1]
+    baseline = float(recent.mean()) if not recent.empty else 0.0
+    if baseline <= 0:
+        return False
+
+    latest_spike = float(vol.iloc[-1]) >= baseline * multiple
+    up_day = float(close.iloc[-1]) >= float(close.iloc[-2])
+    return bool(latest_spike and up_day)
+
+
+def _ma_trend_and_position(df: Optional[pd.DataFrame]) -> Tuple[bool, bool]:
+    """Return (ma50_uptrend, price_above_ma50_and_ma150)."""
+    if df is None or df.empty or "Close" not in df.columns:
+        return False, False
+
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    ma50 = pd.to_numeric(df["MA50"], errors="coerce") if "MA50" in df.columns else close.rolling(50).mean()
+    ma150 = pd.to_numeric(df["MA150"], errors="coerce") if "MA150" in df.columns else close.rolling(150).mean()
+
+    if len(close) < 170:
+        return False, False
+
+    ma50_now = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else None
+    ma50_prev = float(ma50.iloc[-20]) if not pd.isna(ma50.iloc[-20]) else None
+    close_now = float(close.iloc[-1]) if not pd.isna(close.iloc[-1]) else None
+    ma150_now = float(ma150.iloc[-1]) if not pd.isna(ma150.iloc[-1]) else None
+
+    ma50_up = bool(ma50_now is not None and ma50_prev is not None and ma50_now > ma50_prev)
+    above_ma = bool(
+        close_now is not None
+        and ma50_now is not None
+        and ma150_now is not None
+        and close_now > ma50_now
+        and close_now > ma150_now
+    )
+    return ma50_up, above_ma
+
+
+def _ma50_up_and_price_above_ma50(df: Optional[pd.DataFrame]) -> Tuple[bool, bool]:
+    """Return (ma50_uptrend, price_above_ma50)."""
+    if df is None or df.empty or "Close" not in df.columns:
+        return False, False
+
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    ma50 = pd.to_numeric(df["MA50"], errors="coerce") if "MA50" in df.columns else close.rolling(50).mean()
+    if len(close) < 80:
+        return False, False
+
+    ma50_now = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else None
+    ma50_prev = float(ma50.iloc[-20]) if not pd.isna(ma50.iloc[-20]) else None
+    close_now = float(close.iloc[-1]) if not pd.isna(close.iloc[-1]) else None
+
+    ma50_up = bool(ma50_now is not None and ma50_prev is not None and ma50_now > ma50_prev)
+    above_ma50 = bool(close_now is not None and ma50_now is not None and close_now > ma50_now)
+    return ma50_up, above_ma50
+
+
+def _region_country_universe(scope: str) -> List[str]:
+    """Automatic base universe by region/country scope for hierarchical analysis."""
+    key = (scope or "US").strip().lower()
+
+    if key == "us":
+        base = config.get_universe("largecap") + config.get_universe("midcap") + config.get_universe("smallcap")
+    elif key == "germany":
+        base = config.DAX_40 + config.MDAX_SELECTED
+    elif key == "uk":
+        base = config.FTSE_100_SELECTED
+    elif key == "switzerland":
+        base = config.SWISS_SELECTED
+    elif key == "europe":
+        base = config.DAX_40 + config.MDAX_SELECTED + config.EURO_STOXX_EX_DE + config.SWISS_SELECTED + config.FTSE_100_SELECTED
+    else:  # global
+        base = config.get_universe("broad")
+
+    return list(dict.fromkeys(base))
+
+
+def _hierarchical_felix_selection(
+    ctx: AnalysisContext,
+    early_bias_mode: str,
+    industry_filter_mode: str,
+) -> Tuple[List[dict], Dict[str, object]]:
+    """Auto process: winning sectors -> winning industries -> Felix-aligned stocks."""
+    all_scored = list(getattr(ctx, "all_scored_stocks", []) or [])
+    if not all_scored:
+        return [], {"winning_sectors": [], "winning_industries": []}
+
+    flow_df = _build_sector_flow_table(ctx)
+    top_inflow, flow_state_by_sector = _flow_context_maps(flow_df)
+
+    # 1) Winning sectors: require flow support + MA50 up + price above MA50 on sector ETF.
+    sector_etfs = {}
+    sector_etfs.update(getattr(config, "US_SECTOR_ETFS", {}))
+    sector_etfs.update(getattr(config, "EU_SECTOR_ETFS", {}))
+
+    winning_sectors: Set[str] = set()
+    for sector_name, etf in sector_etfs.items():
+        canonical = _normalize_sector_name(sector_name)
+        flow_state = flow_state_by_sector.get(canonical, "Neutral")
+        flow_ok = canonical in top_inflow or flow_state in ("Inflow", "Inflow Accelerating")
+        if not flow_ok:
+            continue
+        etf_df = fetch_ohlcv(etf, period="1y")
+        ma50_up, above_ma50 = _ma50_up_and_price_above_ma50(etf_df)
+        if ma50_up and above_ma50:
+            winning_sectors.add(canonical)
+
+    # 2) Winning industries inside winning sectors.
+    industry_stats: Dict[str, Dict[str, object]] = {}
+    for s in all_scored:
+        canonical = _normalize_sector_name(s.get("sector") or "")
+        if canonical not in winning_sectors:
+            continue
+        ind = (s.get("industry") or "").strip() or "Unclassified"
+        ma50_up, above_ma50 = _ma50_up_and_price_above_ma50(s.get("_df"))
+        passed = bool(ma50_up and above_ma50)
+
+        rec = industry_stats.setdefault(ind, {"sector": canonical, "count": 0, "pass": 0})
+        current_count = rec.get("count", 0)
+        current_pass = rec.get("pass", 0)
+        rec["count"] = int(cast(int, current_count)) + 1
+        rec["pass"] = int(cast(int, current_pass)) + (1 if passed else 0)
+
+    winning_industries: Set[str] = set()
+    for ind, rec in industry_stats.items():
+        count = int(cast(int, rec.get("count", 0)))
+        passed = int(cast(int, rec.get("pass", 0)))
+        ratio = (passed / count) if count else 0.0
+        if count < 2:
+            continue
+        if industry_filter_mode == "All pass":
+            if passed == count:
+                winning_industries.add(ind)
+        else:  # Majority pass
+            if ratio >= 0.5:
+                winning_industries.add(ind)
+
+    # 3) Final stocks: all stocks in winning industries, then ranked by Felix fit and liquidity score.
+    felix_rows = []
+    liquidity_rows = _build_liquidity_winners(all_scored, flow_df, top_n=max(len(all_scored), 50), early_bias_mode=early_bias_mode)
+    liq_map = {str(r.get("Ticker")): float(r.get("Liquidity") or 0.0) for _, r in liquidity_rows.iterrows()} if not liquidity_rows.empty else {}
+
+    for s in all_scored:
+        ind = (s.get("industry") or "").strip() or "Unclassified"
+        if ind not in winning_industries:
+            continue
+        f_fit, f_match, f_missing, f_checks = _felix_method_signals(s, top_inflow, flow_state_by_sector)
+        felix_rows.append({
+            "ticker": s.get("ticker"),
+            "felix_fit": f_fit,
+            "felix_pass": sum(1 for v in f_checks.values() if v),
+            "liquidity": liq_map.get(str(s.get("ticker")), 0.0),
+            "matched": f_match,
+            "missing": f_missing,
+            "stock": s,
+        })
+
+    felix_rows.sort(key=lambda x: (x["felix_fit"], x["liquidity"], float(x["stock"].get("score") or 0.0)), reverse=True)
+
+    selected: List[dict] = []
+    for row in felix_rows:
+        stx = dict(row["stock"])
+        stx["felix_fit"] = row["felix_fit"]
+        stx["felix_pass"] = row["felix_pass"]
+        stx["felix_matched"] = row["matched"]
+        stx["felix_missing"] = row["missing"]
+        stx["liquidity_score"] = row["liquidity"]
+        selected.append(stx)
+
+    meta = {
+        "winning_sectors": sorted(winning_sectors),
+        "winning_industries": sorted(winning_industries),
+        "industry_count": len(winning_industries),
+        "sector_count": len(winning_sectors),
+    }
+    return selected, meta
+
+
+def _heartbeat_pattern_signal(s: dict) -> bool:
+    """Approximate heartbeat/consolidation phase from available technical context."""
+    stage = int(s.get("stage") or 0)
+    df = s.get("_df")
+    if df is None or df.empty or "Close" not in df.columns:
+        return stage == 1
+
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    if len(close) < 70:
+        return stage == 1
+
+    c60 = close.tail(60)
+    c20 = close.tail(20)
+    hi60, lo60 = float(c60.max()), float(c60.min())
+    hi20, lo20 = float(c20.max()), float(c20.min())
+    if lo60 <= 0 or lo20 <= 0:
+        return stage == 1
+
+    range60 = (hi60 - lo60) / lo60
+    range20 = (hi20 - lo20) / lo20
+
+    # Stage 1 is preferred; early stage 2 with still-tight ranges is acceptable.
+    if stage == 1:
+        return True
+    if stage == 2 and range20 <= 0.18 and range60 <= 0.38:
+        return True
+    return False
+
+
+def _felix_method_signals(
+    s: dict,
+    top_inflow: Set[str],
+    flow_state_by_sector: Dict[str, str],
+) -> Tuple[float, str, str, Dict[str, bool]]:
+    """Felix focus: follow money + winning stock pattern checks."""
+    canonical = _normalize_sector_name(s.get("sector") or "")
+    flow_state = flow_state_by_sector.get(canonical, "Neutral")
+
+    liquidity_in = bool(canonical in top_inflow or flow_state in ("Inflow", "Inflow Accelerating"))
+    heartbeat = _heartbeat_pattern_signal(s)
+    ma50_up, above_ma50_ma150 = _ma_trend_and_position(s.get("_df"))
+    vol_spike = _recent_volume_spike(s.get("_df"))
+
+    checks = {
+        "Liquidity Inflow": liquidity_in,
+        "Heartbeat Pattern": heartbeat,
+        "MA50 Trending Up": ma50_up,
+        "Price > MA50 & MA150": above_ma50_ma150,
+        "Recent Volume Spike": vol_spike,
+    }
+    passed = sum(1 for v in checks.values() if v)
+    fit = round((passed / len(checks)) * 100.0, 1)
+
+    matched = [k for k, v in checks.items() if v]
+    missing = [k for k, v in checks.items() if not v]
+    matched_text = " + ".join(matched[:4]) if matched else "No Felix criteria matched"
+    risk_text = " | ".join(missing[:3]) if missing else "All Felix criteria matched"
+    return fit, matched_text, risk_text, checks
+
+
+STRATEGY_LENS_OPTIONS = {
+    "None": "No strategy lens (show default model ranking)",
+    "01 Beginner Long-Term Investor": "Quality-first compounding and broad risk control",
+    "02 DCA Accumulator": "Recurring accumulation with strict thesis protection",
+    "03 90-Day Systematic Trader": "Triple-confirmation process with hard risk rules",
+    "04 Institutional Money-Flow Trader": "Sector-first flow tracking and leader selection",
+    "05 Wall Street Protocol Technical Trader": "4-pillar technical confirmation before entry",
+    "06 Sector Rotation Macro Investor": "Rotate across top momentum sectors via regime",
+    "07 Market Collision Wave Investor": "Follow macro causal-wave sector transitions",
+    "08 AI Infrastructure Investor": "Picks-and-shovels AI infrastructure leadership",
+    "09 AI Power-Stack Investor": "Layered AI exposure with quality/risk balancing",
+    "10 Space Catalyst Trader": "Catalyst + volume + structure confirmation",
+    "11 Quality Runway Growth Investor": "Cash runway + sponsorship + growth inflection",
+    "12 New-Fed Gold/Silver/Bitcoin Macro Trader": "Policy-sensitive macro allocation discipline",
+    "13 Deep-Research 10x Investor": "Rare asymmetric setups with strict quality gates",
+}
+
+
+def _strategy_lens_evaluation(
+    s: dict,
+    top_inflow: Set[str],
+    flow_state_by_sector: Dict[str, str],
+    lens: str,
+) -> Tuple[float, str, str]:
+    """Return fit score (0-100), matched pattern labels, and risk flags for selected lens."""
+    if lens == "None":
+        return 0.0, "", ""
+
+    stage = int(s.get("stage") or 0)
+    canonical = _normalize_sector_name(s.get("sector") or "")
+    flow_state = flow_state_by_sector.get(canonical, "Neutral")
+    rs = float(s.get("rs_bench") or 0.0)
+    ret_1m = float(s.get("ret_1m") or 0.0)
+    ret_3m = float(s.get("ret_3m") or 0.0)
+    prehn = float(s.get("score") or 0.0)
+    pe = s.get("pe")
+    eps = s.get("eps_growth")
+    industry = (s.get("industry") or "").lower()
+    ticker = (s.get("ticker") or "").upper()
+
+    signals = {
+        "stage2": stage == 2,
+        "stage1or2": stage in (1, 2),
+        "inflow": canonical in top_inflow,
+        "flow_positive": flow_state in ("Inflow", "Inflow Accelerating"),
+        "rs_positive": rs > 0,
+        "mom_1m": ret_1m > 0,
+        "mom_3m": ret_3m > 0,
+        "quality72": prehn >= 72,
+        "quality58": prehn >= 58,
+        "eps_positive": (eps is not None) and (float(eps) > 0),
+        "pe_reasonable": (pe is not None) and (0 < float(pe) <= 80),
+        "volume_spike": _recent_volume_spike(s.get("_df")),
+        "ai_exposure": canonical in {"Technology", "Industrials", "Energy", "Communication"},
+        "space_exposure": ("aerospace" in industry) or ("defense" in industry) or ticker in {"RKLB", "LUNR", "ASTS", "SPCE"},
+        "macro_hedge_proxy": canonical in {"Materials", "Energy"} or ticker in {"GLD", "SLV", "GDX", "GDXJ", "SIL", "BITO", "BTC-USD"},
+    }
+
+    rules_by_lens = {
+        "01 Beginner Long-Term Investor": ["quality58", "stage1or2", "pe_reasonable"],
+        "02 DCA Accumulator": ["quality58", "stage1or2", "eps_positive"],
+        "03 90-Day Systematic Trader": ["volume_spike", "stage1or2", "rs_positive", "eps_positive"],
+        "04 Institutional Money-Flow Trader": ["inflow", "flow_positive", "rs_positive", "stage1or2"],
+        "05 Wall Street Protocol Technical Trader": ["stage1or2", "rs_positive", "volume_spike", "mom_3m"],
+        "06 Sector Rotation Macro Investor": ["inflow", "flow_positive", "mom_1m", "mom_3m"],
+        "07 Market Collision Wave Investor": ["flow_positive", "mom_1m", "mom_3m", "rs_positive"],
+        "08 AI Infrastructure Investor": ["ai_exposure", "quality58", "rs_positive", "mom_3m"],
+        "09 AI Power-Stack Investor": ["ai_exposure", "quality58", "mom_1m", "eps_positive"],
+        "10 Space Catalyst Trader": ["space_exposure", "volume_spike", "stage1or2", "eps_positive"],
+        "11 Quality Runway Growth Investor": ["quality58", "eps_positive", "pe_reasonable", "rs_positive"],
+        "12 New-Fed Gold/Silver/Bitcoin Macro Trader": ["macro_hedge_proxy", "stage1or2", "rs_positive", "mom_1m"],
+        "13 Deep-Research 10x Investor": ["stage1or2", "eps_positive", "rs_positive", "mom_3m", "quality58"],
+    }
+
+    matched_labels = {
+        "stage2": "Stage 2",
+        "stage1or2": "Stage 1/2 structure",
+        "inflow": "Top inflow sector",
+        "flow_positive": "Positive sector flow",
+        "rs_positive": "RS > 0",
+        "mom_1m": "1M momentum",
+        "mom_3m": "3M momentum",
+        "quality72": "Strong quality score",
+        "quality58": "Quality score",
+        "eps_positive": "EPS growth positive",
+        "pe_reasonable": "P/E in model range",
+        "volume_spike": "Volume spike",
+        "ai_exposure": "AI-exposed sector",
+        "space_exposure": "Space/aerospace exposure",
+        "macro_hedge_proxy": "Macro-hedge proxy",
+    }
+
+    required = rules_by_lens.get(lens, [])
+    if not required:
+        return 0.0, "", ""
+
+    matched = [k for k in required if signals.get(k)]
+    fit = round((len(matched) / len(required)) * 100.0, 1)
+
+    matched_text = " + ".join(matched_labels[k] for k in matched[:4]) or "No primary pattern match"
+
+    risk_flags = []
+    if stage in (3, 4):
+        risk_flags.append("Late/declining stage")
+    if rs <= 0:
+        risk_flags.append("Negative RS")
+    if not signals["flow_positive"] and lens in {
+        "04 Institutional Money-Flow Trader",
+        "06 Sector Rotation Macro Investor",
+        "07 Market Collision Wave Investor",
+    }:
+        risk_flags.append("Weak sector flow")
+    if lens in {"03 90-Day Systematic Trader", "05 Wall Street Protocol Technical Trader", "10 Space Catalyst Trader"} and not signals["volume_spike"]:
+        risk_flags.append("No volume confirmation")
+    if lens in {"11 Quality Runway Growth Investor", "13 Deep-Research 10x Investor"} and not signals["eps_positive"]:
+        risk_flags.append("No EPS inflection")
+
+    risk_text = " | ".join(risk_flags[:3]) or "No major rule conflict"
+    return fit, matched_text, risk_text
+
+
 def _liquidity_confidence(flow_df: pd.DataFrame, winners_df: pd.DataFrame) -> tuple[int, str]:
     """Return confidence score (0-100) and label for current liquidity regime."""
     if flow_df is None or flow_df.empty:
@@ -331,7 +818,8 @@ def _liquidity_confidence(flow_df: pd.DataFrame, winners_df: pd.DataFrame) -> tu
     total = max(len(flow_df), 1)
     breadth = positive / total
 
-    accel = pd.to_numeric(flow_df.get("Flow Delta"), errors="coerce")
+    accel_source = flow_df["Flow Delta"] if "Flow Delta" in flow_df.columns else pd.Series(dtype=float)
+    accel = pd.to_numeric(accel_source, errors="coerce")
     accel_up = int((accel > 0).sum()) if accel is not None else 0
     accel_ratio = accel_up / total
 
@@ -384,7 +872,7 @@ def _mini_chart(df: Optional[pd.DataFrame], days: int = 90) -> Optional[bytes]:
     shown_pct = round(net_pct, 1)
     line_clr = "#a6e3a1" if shown_pct > 0 else "#f38ba8" if shown_pct < 0 else "#94a3b8"
 
-    vol = pd.to_numeric(plot_df.get("Volume"), errors="coerce") if "Volume" in plot_df.columns else None
+    vol = pd.to_numeric(plot_df["Volume"], errors="coerce") if "Volume" in plot_df.columns else None
     if vol is not None and not vol.isna().all() and float(vol.max()) > 0:
         vol = vol.fillna(0)
         day_dir = close.diff().fillna(0)
@@ -428,11 +916,11 @@ with st.sidebar:
 
     saved_watchlist = config.get_custom_watchlist()
 
-    universe = st.selectbox(
-        "Universe",
-        ["largecap", "midcap", "smallcap"],
+    region_scope = st.selectbox(
+        "Region / Country Scope",
+        ["US", "Germany", "UK", "Switzerland", "Europe", "Global"],
         index=0,
-        help="Select a US market-cap bucket only: large, mid, or small caps.",
+        help="Automatic hierarchical process starts from this scope: sector -> industry -> Felix stock selection.",
     )
 
     watchlist_input = st.text_area(
@@ -456,6 +944,43 @@ with st.sidebar:
         height=110,
         placeholder="e.g. HIMS, ASML.AS, IFX.DE",
         help="Use commas, spaces, or new lines. Appended to the selected universe for this run only.",
+    )
+
+    strategy_lens = st.selectbox(
+        "Strategy Lens",
+        options=list(STRATEGY_LENS_OPTIONS.keys()),
+        index=0,
+        help="Select an investor/trader style from assets/skills and rank opportunities by that rule set.",
+    )
+    st.caption(f"Lens focus: {STRATEGY_LENS_OPTIONS.get(strategy_lens, '')}")
+
+    early_opportunity_bias = st.select_slider(
+        "Early Opportunity Bias",
+        options=["Conservative", "Balanced", "Aggressive"],
+        value="Balanced",
+        help=(
+            "Controls how strongly Liquidity Shift prioritizes stocks with room to run over already-extended winners. "
+            "Conservative = stronger penalty for extension; Aggressive = stronger preference for early inflow setups."
+        ),
+    )
+
+    felix_focus_mode = st.toggle(
+        "Felix Focus Mode",
+        value=True,
+        help=(
+            "Prioritize candidates that match the Felix method: follow liquidity flow + heartbeat consolidation + "
+            "MA trend/position + recent volume spike."
+        ),
+    )
+
+    industry_filter_mode = st.selectbox(
+        "Winning Industry Filter",
+        options=["Majority pass", "All pass"],
+        index=0,
+        help=(
+            "Majority pass: industry qualifies if >=50% of evaluated stocks pass sector/industry Felix MA50 criteria. "
+            "All pass: industry qualifies only if every evaluated stock passes."
+        ),
     )
 
     max_detail = st.slider(
@@ -494,7 +1019,7 @@ if run_btn:
     custom_tickers = _parse_tickers(custom_input)
     saved_watchlist = config.get_custom_watchlist()
 
-    base_tickers = config.get_universe(universe)
+    base_tickers = _region_country_universe(region_scope)
     all_tickers  = list(dict.fromkeys(base_tickers + custom_tickers))
 
     # Propagate UI depth to both screener and deep-analysis stages.
@@ -502,7 +1027,7 @@ if run_btn:
     config.SCREENING["max_candidates"] = depth
     config.MAX_DETAIL_STOCKS = depth
 
-    ctx = AnalysisContext(universe_name=universe, universe_tickers=all_tickers)
+    ctx = AnalysisContext(universe_name=region_scope.lower(), universe_tickers=all_tickers)
 
     with st.status("🔄 Running analysis pipeline…", expanded=True) as _status:
         st.write("📡 Fetching benchmark (S&P 500)…")
@@ -525,7 +1050,24 @@ if run_btn:
 
         st.write(f"🎯 **Agent 3** — Stock Screener ({len(all_tickers)} tickers)…")
         ag_screener.run(ctx)
-        st.write(f"   ✓ {len(ctx.screened_stocks)} candidates after screening")
+
+        st.write("🧠 **Automatic Felix hierarchy** — winning sectors → winning industries → stocks…")
+        hierarchical_stocks, hierarchy_meta = _hierarchical_felix_selection(
+            ctx,
+            early_opportunity_bias,
+            industry_filter_mode,
+        )
+        if hierarchical_stocks:
+            ctx.screened_stocks = hierarchical_stocks[: config.SCREENING["max_candidates"]]
+            st.write(
+                f"   ✓ {len(ctx.screened_stocks)} Felix candidates "
+                f"from {hierarchy_meta.get('sector_count', 0)} sectors and "
+                f"{hierarchy_meta.get('industry_count', 0)} industries"
+            )
+            st.session_state["hierarchy_meta"] = hierarchy_meta
+        else:
+            st.write("   ⚠ No hierarchical Felix candidates found; keeping screener output")
+            st.session_state["hierarchy_meta"] = {"winning_sectors": [], "winning_industries": []}
 
         st.write(f"📈 **Agent 4** — Technical Analyst (top {max_detail})…")
         ag_ta.run(ctx)
@@ -553,20 +1095,23 @@ if run_btn:
 if "ctx" not in st.session_state:
     st.title("📊 Felix Prehn Weekend Market Analyzer")
     st.markdown(
-        "Select a **market-cap universe** in the sidebar (large, mid, or small caps) and "
-        "click **🚀 Run Analysis** to launch the 5-agent pipeline."
+        "Select a **region/country scope** in the sidebar and click **🚀 Run Analysis**. "
+        "The app then runs an automatic hierarchy: **winning sectors -> winning industries -> Felix stock candidates**."
     )
     st.divider()
 
     col_l, col_r = st.columns(2)
     with col_l:
-        st.subheader("📋 Universe Coverage")
+        st.subheader("📋 Scope Coverage")
         st.markdown("""
-| Universe | Exchanges |
+    | Scope | Coverage |
 |---|---|
-| Large Cap | US large-cap universe |
-| Mid Cap | US mid-cap universe |
-| Small Cap | US small-cap universe |
+    | US | Large + Mid + Small cap sets |
+    | Germany | DAX + MDAX |
+    | UK | FTSE selection |
+    | Switzerland | Swiss selection |
+    | Europe | DE + Euro ex-DE + CH + UK |
+    | Global | Broad multi-region mix |
         """)
 
     with col_r:
@@ -609,6 +1154,24 @@ EPS growth, ROE, P/E, margins, strengths & risks.
 
 ⭐ STRONG BUY ≥ 72 · ✅ BUY ≥ 58 · 👀 WATCH ≥ 42 · ❌ AVOID < 42
     """)
+
+    st.divider()
+    st.subheader("✅ Felix Focus Mode")
+    st.markdown(
+        """
+- **Follow the money**: prioritize sectors and stocks with active liquidity inflow.
+- **Find winning setups early**: favor names with heartbeat-style consolidation, MA50 trend up, price above MA50 and MA150, and recent volume spikes.
+- The app surfaces this directly via **Felix Fit**, **Felix Pass**, **Felix Matched**, and **Felix Missing** in Liquidity Shift and Screened Stocks.
+        """
+    )
+
+    st.divider()
+    st.subheader("🧠 Strategy Lenses From assets/skills")
+    st.markdown("Use the sidebar **Strategy Lens** selector to rank ideas by a chosen rulebook:")
+    for name, desc in STRATEGY_LENS_OPTIONS.items():
+        if name == "None":
+            continue
+        st.markdown(f"- **{name}**: {desc}")
     st.stop()
 
 
@@ -619,7 +1182,13 @@ EPS growth, ROE, P/E, margins, strengths & risks.
 ctx    = st.session_state.ctx
 stocks = ctx.screened_stocks or []
 _flow_df_for_kpi = _build_sector_flow_table(ctx)
-_winners_for_kpi = _build_liquidity_winners(stocks, _flow_df_for_kpi, top_n=max(12, config.MAX_DETAIL_STOCKS))
+_winners_for_kpi = _build_liquidity_winners(
+    stocks,
+    _flow_df_for_kpi,
+    top_n=max(12, config.MAX_DETAIL_STOCKS),
+    early_bias_mode=early_opportunity_bias,
+)
+_top_inflow_sectors, _flow_state_by_sector = _flow_context_maps(_flow_df_for_kpi)
 _liq_conf_score, _liq_conf_label = _liquidity_confidence(_flow_df_for_kpi, _winners_for_kpi)
 
 # ── Top KPI row ───────────────────────────────────────────────────────────────
@@ -639,6 +1208,14 @@ k4.metric("🎯 Candidates", len(stocks))
 k5.metric("🏆 Top Score", f"{stocks[0]['score']}/100" if stocks else "–")
 k6.metric("💧 Liquidity Confidence", f"{_liq_conf_score}/100", _liq_conf_label)
 st.divider()
+
+hier_meta = st.session_state.get("hierarchy_meta")
+if isinstance(hier_meta, dict) and hier_meta:
+    st.caption(
+        f"Hierarchy summary: {hier_meta.get('sector_count', 0)} winning sectors -> "
+        f"{hier_meta.get('industry_count', 0)} winning industries -> "
+        f"{len(stocks)} shortlisted stocks  ·  Industry filter: {industry_filter_mode}"
+    )
 
 with st.expander("📚 Abbreviations & Stage Guide", expanded=False):
     st.markdown(
@@ -707,7 +1284,7 @@ with tab1:
             })
         df_idx = pd.DataFrame(rows).set_index("Index")
 
-        pct_cols = ["1D%", "1W%", "1M%", "YTD%", "1Y%"]
+        pct_cols: List[Hashable] = ["1D%", "1W%", "1M%", "YTD%", "1Y%"]
         styled = (
             df_idx.style
             .map(_pct_style, subset=pct_cols)
@@ -790,8 +1367,40 @@ with tab3:
     st.subheader("Where Liquidity Is Moving")
     st.caption(
         "Flow State blends weighted sector momentum with short-term acceleration. "
-        "Stocks are ranked by Prehn score + sector flow alignment + relative strength."
+        "Stocks are ranked to favor early liquidity inflow candidates with more upside left, "
+        "while penalizing already-extended moves."
     )
+    st.caption(f"Early Opportunity Bias: **{early_opportunity_bias}**")
+    if felix_focus_mode:
+        st.caption("Felix Focus Mode: **ON** (prioritizing money-flow + winning-stock pattern alignment)")
+    t3c1, t3c2 = st.columns([1, 1])
+    with t3c1:
+        felix_only_tab3 = st.checkbox(
+            "Felix-only candidates",
+            value=False,
+            key="felix_only_tab3",
+            help="When enabled, show only names that pass a minimum number of Felix criteria.",
+        )
+    with t3c2:
+        felix_min_pass_tab3 = st.select_slider(
+            "Felix min pass",
+            options=[4, 5],
+            value=4,
+            key="felix_min_pass_tab3",
+            help="4 = strong alignment, 5 = strict all-criteria alignment.",
+        )
+    with st.expander("What does Early Opportunity Bias do?", expanded=False):
+        st.markdown(
+            """
+            - **Conservative**: applies a stronger extension penalty. It favors cleaner, less stretched setups and deprioritizes names that already ran hard.
+            - **Balanced**: neutral weighting between early-opportunity signals and momentum continuation.
+            - **Aggressive**: boosts early inflow + upside-left signals more strongly and softens extension penalties, so emerging movers surface earlier.
+
+            This slider changes only **Liquidity Shift ranking behavior**. It does not change raw market data, technical analysis, or fundamental analysis outputs.
+            """
+        )
+    if strategy_lens != "None":
+        st.caption(f"Strategy lens active: **{strategy_lens}**")
 
     flow_df = _flow_df_for_kpi.copy() if _flow_df_for_kpi is not None else pd.DataFrame()
     winners_df = _winners_for_kpi.copy() if _winners_for_kpi is not None else pd.DataFrame()
@@ -827,6 +1436,75 @@ with tab3:
             allowed_canonical = set(flow_df["Canonical"].tolist()) if "Canonical" in flow_df.columns else set()
             if allowed_canonical:
                 winners_df = winners_df[winners_df["Flow Sector"].isin(allowed_canonical)]
+
+        if strategy_lens != "None":
+            by_ticker = {x.get("ticker"): x for x in (stocks or [])}
+            lens_fit = []
+            lens_match = []
+            lens_risk = []
+            for _, row in winners_df.iterrows():
+                base = by_ticker.get(row.get("Ticker"))
+                if not base:
+                    lens_fit.append(0.0)
+                    lens_match.append("No stock context")
+                    lens_risk.append("Unavailable")
+                    continue
+                fit, matched, risk_text = _strategy_lens_evaluation(
+                    base,
+                    _top_inflow_sectors,
+                    _flow_state_by_sector,
+                    strategy_lens,
+                )
+                lens_fit.append(fit)
+                lens_match.append(matched)
+                lens_risk.append(risk_text)
+
+            winners_df = winners_df.assign(
+                **{
+                    "Lens Fit": lens_fit,
+                    "Matched Patterns": lens_match,
+                    "Risk Flags": lens_risk,
+                }
+            )
+            winners_df = winners_df.sort_values(["Lens Fit", "Liquidity", "Prehn"], ascending=False)
+
+        by_ticker = {x.get("ticker"): x for x in (stocks or [])}
+        felix_fit_vals = []
+        felix_match_vals = []
+        felix_risk_vals = []
+        felix_pass_count_vals = []
+        for _, row in winners_df.iterrows():
+            base = by_ticker.get(row.get("Ticker"))
+            if not base:
+                felix_fit_vals.append(0.0)
+                felix_match_vals.append("No stock context")
+                felix_risk_vals.append("Unavailable")
+                felix_pass_count_vals.append(0)
+                continue
+            f_fit, f_match, f_risk, f_checks = _felix_method_signals(
+                base,
+                _top_inflow_sectors,
+                _flow_state_by_sector,
+            )
+            felix_fit_vals.append(f_fit)
+            felix_match_vals.append(f_match)
+            felix_risk_vals.append(f_risk)
+            felix_pass_count_vals.append(sum(1 for v in f_checks.values() if v))
+
+        winners_df = winners_df.assign(
+            **{
+                "Felix Fit": felix_fit_vals,
+                "Felix Matched": felix_match_vals,
+                "Felix Missing": felix_risk_vals,
+                "Felix Pass": felix_pass_count_vals,
+            }
+        )
+
+        if felix_focus_mode:
+            winners_df = winners_df.sort_values(["Felix Fit", "Liquidity", "Prehn"], ascending=False)
+
+        if felix_only_tab3:
+            winners_df = winners_df[winners_df["Felix Pass"] >= int(felix_min_pass_tab3)]
         winners_df = winners_df.reset_index(drop=True)
 
     if flow_df.empty:
@@ -860,8 +1538,8 @@ with tab3:
                     st.write(f"🔴 {r['Region']} · {r['Sector']} ({r['Momentum']:+.2f})")
 
         st.markdown("#### Sector Flow Matrix")
-        show_cols = ["Region", "Sector", "Flow State", "Momentum", "Flow Delta", "1W%", "1M%", "3M%", "1Y%"]
-        fmt_map = {
+        show_cols: List[Hashable] = ["Region", "Sector", "Flow State", "Momentum", "Flow Delta", "1W%", "1M%", "3M%", "1Y%"]
+        fmt_map: Dict[Hashable, object] = {
             "Momentum": "{:+.2f}",
             "Flow Delta": "{:+.2f}",
             "1W%": "{:+.2f}%",
@@ -874,7 +1552,7 @@ with tab3:
             .map(_flow_state_style, subset=["Flow State"])
             .map(_pct_style, subset=["1W%", "1M%", "3M%", "1Y%"])
             .map(_pct_style, subset=["Flow Delta"])
-            .format(fmt_map, na_rep="–"),
+            .format(cast(Any, fmt_map), na_rep="–"),
             width="stretch",
             height=420,
         )
@@ -901,12 +1579,16 @@ with tab3:
             column_config={
                 "Why": st.column_config.TextColumn(
                     "Why",
-                    help="Main reasons this stock ranks high in current liquidity conditions",
+                    help="Main reasons this stock ranks high: inflow alignment, early structure, and upside-left signals.",
                     width="large",
+                ),
+                "Risk": st.column_config.TextColumn(
+                    "Risk",
+                    help="Quick risk view (for example extended/late-stage/weak RS).",
                 ),
                 "Liquidity": st.column_config.ProgressColumn(
                     "Liquidity",
-                    help="Composite liquidity-shift score (0-100): sector flow alignment + stock quality + trend context.",
+                    help="Composite score (0-100): inflow strength + quality + trend context + upside-left profile - extension penalty.",
                     min_value=0,
                     max_value=100,
                     format="%.1f /100",
@@ -935,14 +1617,60 @@ with tab3:
                     help="Relative strength versus S&P 500.",
                     format="%.2f%%",
                 ),
+                "Felix Fit": st.column_config.ProgressColumn(
+                    "Felix Fit",
+                    help="Felix method alignment score across 5 checks.",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f%%",
+                ),
+                "Felix Pass": st.column_config.NumberColumn(
+                    "Felix Pass",
+                    help="Number of Felix criteria passed (out of 5).",
+                    format="%d /5",
+                ),
+                "Felix Matched": st.column_config.TextColumn(
+                    "Felix Matched",
+                    help="Matched Felix criteria: liquidity flow, heartbeat, MA trend/position, volume.",
+                    width="large",
+                ),
+                "Felix Missing": st.column_config.TextColumn(
+                    "Felix Missing",
+                    help="Unmet Felix criteria for this candidate.",
+                    width="large",
+                ),
+                "Lens Fit": st.column_config.ProgressColumn(
+                    "Lens Fit",
+                    help="How strongly this stock matches the selected strategy's pattern checklist.",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f%%",
+                ),
+                "Matched Patterns": st.column_config.TextColumn(
+                    "Matched Patterns",
+                    help="Top matched pattern-recognition signals for the selected lens.",
+                    width="large",
+                ),
+                "Risk Flags": st.column_config.TextColumn(
+                    "Risk Flags",
+                    help="Rule conflicts or risk guard-rail warnings for the selected lens.",
+                    width="large",
+                ),
             },
         )
         st.caption(
-            "Liquidity score combines stock quality (Prehn), stage, relative strength, "
-            "and alignment with current sector inflows. Click a row to inspect it in Deep Dive."
+            "Liquidity score now emphasizes names with strong inflow and room to run, "
+            "not only names that already made the biggest move. Felix Fit shows direct alignment to the Felix method. "
+            "Click a row to inspect it in Deep Dive."
         )
 
-        sel_rows = (win_event.selection.rows if win_event and win_event.selection else [])
+        sel_rows: List[int] = []
+        if isinstance(win_event, dict):
+            selection = win_event.get("selection")
+            if isinstance(selection, dict):
+                raw_rows = selection.get("rows", [])
+                if isinstance(raw_rows, list):
+                    sel_rows = [int(r) for r in raw_rows]
         if sel_rows:
             sel_ticker = winners_df.iloc[sel_rows[0]]["Ticker"]
             st.session_state["deep_dive_ticker"] = sel_ticker
@@ -1097,7 +1825,7 @@ with tab4:
                     "P/E":     round(s["pe"],  1) if s.get("pe")  else None,
                 })
             df_drill = pd.DataFrame(drill_rows)
-            pct_d    = ["1M%", "3M%", "1Y%", "RS%"]
+            pct_d: List[Hashable] = ["1M%", "3M%", "1Y%", "RS%"]
             styled_drill = (
                 df_drill.style
                 .map(_score_style, subset=["Score"])
@@ -1139,8 +1867,30 @@ with tab5:
     if not stocks:
         st.warning("No candidates passed screening.")
     else:
+        if felix_focus_mode:
+            st.info(
+                "Felix Focus Mode active: ranking by Felix method alignment first, then model quality."
+            )
+
+        if strategy_lens != "None":
+            st.info(
+                f"Strategy Lens active: **{strategy_lens}**  \n"
+                f"{STRATEGY_LENS_OPTIONS.get(strategy_lens, '')}"
+            )
+
         rows = []
         for s in stocks:
+            felix_fit, felix_match, felix_missing, felix_checks = _felix_method_signals(
+                s,
+                _top_inflow_sectors,
+                _flow_state_by_sector,
+            )
+            fit, matched, risk_text = _strategy_lens_evaluation(
+                s,
+                _top_inflow_sectors,
+                _flow_state_by_sector,
+                strategy_lens,
+            )
             rows.append({
                 "Ticker":  s["ticker"],
                 "Name":    (s.get("name") or "")[:28],
@@ -1155,10 +1905,41 @@ with tab5:
                 "RSI":     round(s["rsi"], 0)           if s.get("rsi")        else None,
                 "P/E":     round(s["pe"],  1)           if s.get("pe")         else None,
                 "EPS↑":    f"{s['eps_growth']*100:.0f}%" if s.get("eps_growth") is not None else "–",
+                "Felix Fit": felix_fit,
+                "Felix Pass": sum(1 for v in felix_checks.values() if v),
+                "Felix Matched": felix_match,
+                "Felix Missing": felix_missing,
+                "Lens Fit": fit,
+                "Matched Patterns": matched,
+                "Risk Flags": risk_text,
             })
 
         df_sc = pd.DataFrame(rows)
-        pct_cols_sc = ["1M%", "3M%", "1Y%", "RS%"]
+
+        t5c1, t5c2 = st.columns([1, 1])
+        with t5c1:
+            felix_only_tab5 = st.checkbox(
+                "Felix-only candidates",
+                value=False,
+                key="felix_only_tab5",
+                help="When enabled, show only names that pass a minimum number of Felix criteria.",
+            )
+        with t5c2:
+            felix_min_pass_tab5 = st.select_slider(
+                "Felix min pass",
+                options=[4, 5],
+                value=4,
+                key="felix_min_pass_tab5",
+                help="4 = strong alignment, 5 = strict all-criteria alignment.",
+            )
+
+        if felix_only_tab5:
+            df_sc = df_sc[df_sc["Felix Pass"] >= int(felix_min_pass_tab5)]
+
+        if felix_focus_mode:
+            df_sc = df_sc.sort_values(["Felix Fit", "Score"], ascending=False).reset_index(drop=True)
+        elif strategy_lens != "None":
+            df_sc = df_sc.sort_values(["Lens Fit", "Score"], ascending=False).reset_index(drop=True)
 
         sc_event = st.dataframe(
             df_sc,
@@ -1173,6 +1954,45 @@ with tab5:
                     min_value=0,
                     max_value=100,
                     format="%d /100",
+                ),
+                "Felix Fit": st.column_config.ProgressColumn(
+                    "Felix Fit",
+                    help="Felix method alignment score across 5 checks.",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f%%",
+                ),
+                "Felix Pass": st.column_config.NumberColumn(
+                    "Felix Pass",
+                    help="Number of Felix criteria passed (out of 5).",
+                    format="%d /5",
+                ),
+                "Felix Matched": st.column_config.TextColumn(
+                    "Felix Matched",
+                    help="Matched Felix criteria: liquidity flow, heartbeat, MA trend/position, volume.",
+                    width="large",
+                ),
+                "Felix Missing": st.column_config.TextColumn(
+                    "Felix Missing",
+                    help="Unmet Felix criteria for this candidate.",
+                    width="large",
+                ),
+                "Lens Fit": st.column_config.ProgressColumn(
+                    "Lens Fit",
+                    help="How strongly this stock matches the selected strategy's pattern checklist.",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f%%",
+                ),
+                "Matched Patterns": st.column_config.TextColumn(
+                    "Matched Patterns",
+                    help="Top matched pattern-recognition signals for the selected lens.",
+                    width="large",
+                ),
+                "Risk Flags": st.column_config.TextColumn(
+                    "Risk Flags",
+                    help="Rule conflicts or risk guard-rail warnings for the selected lens.",
+                    width="large",
                 ),
                 "Stage": st.column_config.TextColumn(
                     "Stage",
@@ -1216,11 +2036,20 @@ with tab5:
         )
         st.caption(
             "Score 0–100  ·  Stage S2 = advancing (ideal entry per Weinstein/Prehn)  "
-            "·  RS% = 1Y return relative to S&P 500  ·  **Click a row to open it in Deep Dive ↗**"
+            "·  RS% = 1Y return relative to S&P 500  "
+            "·  Felix Fit = direct method alignment (money flow + heartbeat + MA + volume)  "
+            "·  Lens Fit shows alignment with selected assets/skills playbook  "
+            "·  **Click a row to open it in Deep Dive ↗**"
         )
 
         # Handle row click → pre-select in Deep Dive tab
-        sel_rows = (sc_event.selection.rows if sc_event and sc_event.selection else [])
+        sel_rows: List[int] = []
+        if isinstance(sc_event, dict):
+            selection = sc_event.get("selection")
+            if isinstance(selection, dict):
+                raw_rows = selection.get("rows", [])
+                if isinstance(raw_rows, list):
+                    sel_rows = [int(r) for r in raw_rows]
         if sel_rows:
             sel_ticker = rows[sel_rows[0]]["Ticker"]
             st.session_state["deep_dive_ticker"] = sel_ticker

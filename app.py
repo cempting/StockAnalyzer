@@ -750,6 +750,191 @@ def _liquidity_confidence(flow_df: pd.DataFrame, winners_df: pd.DataFrame) -> tu
     return score, label
 
 
+def _stock_volatility_pct(df: Optional[pd.DataFrame], lookback: int = 20) -> Optional[float]:
+    """Realized annualized volatility estimate based on recent daily closes."""
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    ret = close.pct_change().dropna()
+    if len(ret) < max(8, lookback // 2):
+        return None
+    window = ret.tail(lookback)
+    if window.empty:
+        return None
+    vol = float(window.std()) * (252.0 ** 0.5) * 100.0
+    if pd.isna(vol):
+        return None
+    return round(max(vol, 0.0), 2)
+
+
+def _vol_bucket(vol_pct: Optional[float]) -> str:
+    if vol_pct is None or pd.isna(vol_pct):
+        return "n/a"
+    v = float(vol_pct)
+    if v < 22.0:
+        return "Low"
+    if v < 38.0:
+        return "Medium"
+    return "High"
+
+
+def _build_industry_regime_maps(stocks: List[dict]) -> Dict[str, Dict[str, float]]:
+    """Compute industry baseline strength (MRSI proxy) and volatility baselines."""
+    by_ind: Dict[str, Dict[str, List[float]]] = {}
+    for s in stocks or []:
+        ind = (s.get("industry") or "").strip() or "Unclassified"
+        rec = by_ind.setdefault(ind, {"rs": [], "r1m": [], "r3m": [], "vol": []})
+
+        rs = s.get("rs_bench")
+        if rs is not None and not pd.isna(rs):
+            rec["rs"].append(float(rs))
+
+        r1m = s.get("ret_1m")
+        if r1m is not None and not pd.isna(r1m):
+            rec["r1m"].append(float(r1m))
+
+        r3m = s.get("ret_3m")
+        if r3m is not None and not pd.isna(r3m):
+            rec["r3m"].append(float(r3m))
+
+        vol = _stock_volatility_pct(s.get("_df"))
+        if vol is not None and not pd.isna(vol):
+            rec["vol"].append(float(vol))
+
+    out: Dict[str, Dict[str, float]] = {}
+    for ind, vals in by_ind.items():
+        rs_vals = vals.get("rs", [])
+        r1m_vals = vals.get("r1m", [])
+        r3m_vals = vals.get("r3m", [])
+        vol_vals = vals.get("vol", [])
+
+        out[ind] = {
+            "mrsi": round(sum(rs_vals) / len(rs_vals), 2) if rs_vals else 0.0,
+            "industry_1m": round(sum(r1m_vals) / len(r1m_vals), 2) if r1m_vals else 0.0,
+            "industry_3m": round(sum(r3m_vals) / len(r3m_vals), 2) if r3m_vals else 0.0,
+            "industry_vol": round(sum(vol_vals) / len(vol_vals), 2) if vol_vals else 0.0,
+        }
+    return out
+
+
+def _classify_stock_style(s: dict) -> str:
+    """Classify stock profile as Growth, Quality, Blend, or Speculative."""
+    eps_g = s.get("eps_growth")
+    rev_g = s.get("rev_growth")
+    roe = s.get("roe")
+    margin = s.get("_fund", {}).get("profit_margins") if isinstance(s.get("_fund"), dict) else None
+
+    growth_points = 0
+    quality_points = 0
+
+    if eps_g is not None and not pd.isna(eps_g):
+        growth_points += 2 if float(eps_g) >= 0.25 else 1 if float(eps_g) >= 0.12 else 0
+    if rev_g is not None and not pd.isna(rev_g):
+        growth_points += 2 if float(rev_g) >= 0.18 else 1 if float(rev_g) >= 0.08 else 0
+    if (s.get("ret_3m") is not None) and (not pd.isna(s.get("ret_3m"))):
+        growth_points += 1 if float(s.get("ret_3m") or 0.0) > 15.0 else 0
+
+    if roe is not None and not pd.isna(roe):
+        quality_points += 2 if float(roe) >= 0.20 else 1 if float(roe) >= 0.12 else 0
+    if margin is not None and not pd.isna(margin):
+        quality_points += 2 if float(margin) >= 0.15 else 1 if float(margin) >= 0.08 else 0
+    pe = s.get("pe")
+    if pe is not None and not pd.isna(pe):
+        quality_points += 1 if 0 < float(pe) <= 35 else 0
+
+    if growth_points >= 4 and growth_points >= quality_points + 1:
+        return "Growth"
+    if quality_points >= 4 and quality_points >= growth_points + 1:
+        return "Quality"
+    if growth_points <= 1 and quality_points <= 1:
+        return "Speculative"
+    return "Blend"
+
+
+def _market_sentiment_signal(flow_df: pd.DataFrame, stocks: List[dict]) -> Dict[str, object]:
+    """Market-consumer sentiment: fear/greed + overbought/oversold + style tilt."""
+    rsi_vals: List[float] = []
+    ret_1m_vals: List[float] = []
+    for s in stocks:
+        rsi_raw = s.get("rsi")
+        if rsi_raw is not None and not pd.isna(rsi_raw):
+            rsi_vals.append(float(cast(float, rsi_raw)))
+
+        r1m_raw = s.get("ret_1m")
+        if r1m_raw is not None and not pd.isna(r1m_raw):
+            ret_1m_vals.append(float(cast(float, r1m_raw)))
+
+    avg_rsi = round(sum(rsi_vals) / len(rsi_vals), 1) if rsi_vals else None
+    pos_1m_ratio = (sum(1 for x in ret_1m_vals if x > 0) / len(ret_1m_vals)) if ret_1m_vals else 0.5
+
+    if flow_df is None or flow_df.empty or "Momentum" not in flow_df.columns:
+        flow_ratio = 0.5
+        accel_ratio = 0.5
+    else:
+        mom = pd.to_numeric(flow_df["Momentum"], errors="coerce")
+        flow_ratio = float((mom > 0).sum()) / max(1, int(mom.notna().sum()))
+        if "Flow Delta" in flow_df.columns:
+            accel = pd.to_numeric(flow_df["Flow Delta"], errors="coerce")
+            accel_ratio = float((accel > 0).sum()) / max(1, int(accel.notna().sum())) if int(accel.notna().sum()) else 0.5
+        else:
+            accel_ratio = 0.5
+
+    rsi_comp = 50.0 if avg_rsi is None else max(0.0, min(100.0, ((avg_rsi - 25.0) / 50.0) * 100.0))
+    breadth_comp = pos_1m_ratio * 100.0
+    flow_comp = (0.7 * flow_ratio + 0.3 * accel_ratio) * 100.0
+
+    fear_greed = int(round(max(0.0, min(100.0, 0.40 * rsi_comp + 0.30 * breadth_comp + 0.30 * flow_comp))))
+
+    if fear_greed <= 20:
+        fg_label = "Extreme Fear"
+    elif fear_greed <= 40:
+        fg_label = "Fear"
+    elif fear_greed <= 60:
+        fg_label = "Neutral"
+    elif fear_greed <= 80:
+        fg_label = "Greed"
+    else:
+        fg_label = "Extreme Greed"
+
+    if avg_rsi is None:
+        obos = "Neutral"
+    elif avg_rsi >= 68:
+        obos = "Overbought"
+    elif avg_rsi <= 38:
+        obos = "Oversold"
+    else:
+        obos = "Balanced"
+
+    growth_cnt = sum(1 for s in stocks if _classify_stock_style(s) == "Growth")
+    quality_cnt = sum(1 for s in stocks if _classify_stock_style(s) == "Quality")
+
+    if fear_greed >= 72 or obos == "Overbought":
+        tilt = "Favor Quality"
+        tilt_note = "Risk is warm/extended; prioritize resilient balance sheets and steady cashflow."
+    elif fear_greed <= 38 and obos == "Oversold":
+        tilt = "Quality Core + Selective Growth"
+        tilt_note = "Risk-off regime; keep quality core and add growth only on confirmed trend reversals."
+    elif fear_greed <= 45:
+        tilt = "Slight Quality Bias"
+        tilt_note = "Sentiment still cautious; quality leadership is usually more durable in this phase."
+    else:
+        tilt = "Balanced (Growth + Quality)"
+        tilt_note = "Neutral-to-constructive backdrop; blend growth upside with quality stability."
+
+    return {
+        "fear_greed": fear_greed,
+        "fear_greed_label": fg_label,
+        "overbought_oversold": obos,
+        "avg_rsi": avg_rsi,
+        "breadth_positive_1m": round(pos_1m_ratio * 100.0, 1),
+        "flow_positive": round(flow_ratio * 100.0, 1),
+        "growth_count": growth_cnt,
+        "quality_count": quality_cnt,
+        "tilt": tilt,
+        "tilt_note": tilt_note,
+    }
+
+
 def _mini_chart(df: Optional[pd.DataFrame], days: int = 90) -> Optional[bytes]:
     """
     Compact sparkline with separate panels for price and volume.
@@ -1134,6 +1319,8 @@ _winners_for_kpi = _build_liquidity_winners(
 )
 _top_inflow_sectors, _flow_state_by_sector = _flow_context_maps(_flow_df_for_kpi)
 _liq_conf_score, _liq_conf_label = _liquidity_confidence(_flow_df_for_kpi, _winners_for_kpi)
+_industry_regimes = _build_industry_regime_maps(stocks)
+_market_sentiment = _market_sentiment_signal(_flow_df_for_kpi, stocks)
 
 # ── Top KPI row ───────────────────────────────────────────────────────────────
 st.title(f"📊 Analysis – {st.session_state.run_time}")
@@ -1152,6 +1339,21 @@ k4.metric("🎯 Candidates", len(stocks))
 k5.metric("🏆 Top Score", f"{stocks[0]['score']}/100" if stocks else "–")
 k6.metric("💧 Liquidity Confidence", f"{_liq_conf_score}/100", _liq_conf_label)
 st.divider()
+
+st.subheader("🧭 Market Consumer Sentiment")
+s1, s2, s3, s4 = st.columns(4)
+s1.metric("Fear & Greed", f"{_market_sentiment.get('fear_greed', 0)}/100", str(_market_sentiment.get("fear_greed_label", "Neutral")))
+s2.metric("Overbought / Oversold", str(_market_sentiment.get("overbought_oversold", "Neutral")))
+s3.metric("Avg RSI (screen)", f"{_market_sentiment.get('avg_rsi', '–')}")
+s4.metric("1M Breadth", f"{_market_sentiment.get('breadth_positive_1m', 0):.1f}%")
+st.info(
+    f"Current style tilt: **{_market_sentiment.get('tilt', 'Balanced')}**. "
+    f"{_market_sentiment.get('tilt_note', '')}"
+)
+st.caption(
+    "Method: Fear/Greed combines RSI tone, positive-1M breadth, and sector-flow breadth. "
+    "Use it as regime guidance, not a standalone timing signal."
+)
 
 hier_meta = st.session_state.get("hierarchy_meta")
 if isinstance(hier_meta, dict) and hier_meta:
@@ -1330,6 +1532,12 @@ with tab_liquidity:
         felix_match_vals = []
         felix_risk_vals = []
         felix_pass_count_vals = []
+        vol_vals = []
+        vol_regime_vals = []
+        style_vals = []
+        mrsi_vals = []
+        outperf_vals = []
+        price_vs_mrsi_vals = []
         for _, row in winners_df.iterrows():
             base = by_ticker.get(row.get("Ticker"))
             if not base:
@@ -1337,6 +1545,12 @@ with tab_liquidity:
                 felix_match_vals.append("No stock context")
                 felix_risk_vals.append("Unavailable")
                 felix_pass_count_vals.append(0)
+                vol_vals.append(None)
+                vol_regime_vals.append("n/a")
+                style_vals.append("n/a")
+                mrsi_vals.append(None)
+                outperf_vals.append(None)
+                price_vs_mrsi_vals.append(None)
                 continue
             f_fit, f_match, f_risk, f_checks = _felix_method_signals(
                 base,
@@ -1348,12 +1562,37 @@ with tab_liquidity:
             felix_risk_vals.append(f_risk)
             felix_pass_count_vals.append(sum(1 for v in f_checks.values() if v))
 
+            vol = _stock_volatility_pct(base.get("_df"))
+            vol_vals.append(vol)
+            vol_regime_vals.append(_vol_bucket(vol))
+            style_vals.append(_classify_stock_style(base))
+
+            ind = (base.get("industry") or "").strip() or "Unclassified"
+            regime = _industry_regimes.get(ind, {})
+            mrsi = float(regime.get("mrsi", 0.0))
+            mrsi_vals.append(mrsi)
+
+            stock_rs = base.get("rs_bench")
+            outperf = (float(stock_rs) - mrsi) if stock_rs is not None and not pd.isna(stock_rs) else None
+            outperf_vals.append(round(outperf, 2) if outperf is not None else None)
+
+            r1m = base.get("ret_1m")
+            industry_1m = float(regime.get("industry_1m", 0.0))
+            px_vs = (float(r1m) - industry_1m) if r1m is not None and not pd.isna(r1m) else None
+            price_vs_mrsi_vals.append(round(px_vs, 2) if px_vs is not None else None)
+
         winners_df = winners_df.assign(
             **{
                 "Felix Fit": felix_fit_vals,
                 "Felix Matched": felix_match_vals,
                 "Felix Missing": felix_risk_vals,
                 "Felix Pass": felix_pass_count_vals,
+                "Vol 20d Ann%": vol_vals,
+                "Vol Regime": vol_regime_vals,
+                "Style": style_vals,
+                "MRSI%": mrsi_vals,
+                "Outperf vs MRSI%": outperf_vals,
+                "Price vs MRSI%": price_vs_mrsi_vals,
             }
         )
 
@@ -1496,6 +1735,34 @@ with tab_liquidity:
                     help="Unmet Felix criteria for this candidate.",
                     width="large",
                 ),
+                "Vol 20d Ann%": st.column_config.NumberColumn(
+                    "Vol 20d Ann%",
+                    help="Realized annualized volatility estimate from recent daily returns.",
+                    format="%.2f%%",
+                ),
+                "Vol Regime": st.column_config.TextColumn(
+                    "Vol Regime",
+                    help="Volatility bucket: Low / Medium / High.",
+                ),
+                "Style": st.column_config.TextColumn(
+                    "Style",
+                    help="Rule-based profile classification: Growth / Quality / Blend / Speculative.",
+                ),
+                "MRSI%": st.column_config.NumberColumn(
+                    "MRSI%",
+                    help="Industry strength proxy: average RS vs S&P of stocks in the same industry.",
+                    format="%.2f%%",
+                ),
+                "Outperf vs MRSI%": st.column_config.NumberColumn(
+                    "Outperf vs MRSI%",
+                    help="Stock RS minus industry MRSI. Positive values indicate industry outperformance.",
+                    format="%.2f%%",
+                ),
+                "Price vs MRSI%": st.column_config.NumberColumn(
+                    "Price vs MRSI%",
+                    help="Stock 1M return minus industry 1M baseline. Positive values indicate current price leadership.",
+                    format="%.2f%%",
+                ),
             },
         )
         st.caption(
@@ -1538,6 +1805,9 @@ with tab_industries:
             r1w     = [s["ret_1w"]   for s in stks if s.get("ret_1w")  is not None]
             r1m     = [s["ret_1m"]   for s in stks if s.get("ret_1m")  is not None]
             r3m     = [s["ret_3m"]   for s in stks if s.get("ret_3m")  is not None]
+            rs_vals = [s["rs_bench"] for s in stks if s.get("rs_bench") is not None]
+            vol_vals = [_stock_volatility_pct(s.get("_df")) for s in stks]
+            vol_vals = [float(v) for v in vol_vals if v is not None and not pd.isna(v)]
             top_s   = max(stks, key=lambda x: x["score"])
             industry_etfs = getattr(config, "INDUSTRY_ETFS", {})
             etf_t   = industry_etfs.get(ind) if isinstance(industry_etfs, dict) else None
@@ -1549,6 +1819,8 @@ with tab_industries:
                 "avg_1w":     round(sum(r1w) / len(r1w), 2) if r1w else None,
                 "avg_1m":     round(sum(r1m) / len(r1m), 2) if r1m else None,
                 "avg_3m":     round(sum(r3m) / len(r3m), 2) if r3m else None,
+                "mrsi":       round(sum(rs_vals) / len(rs_vals), 2) if rs_vals else 0.0,
+                "avg_vol":    round(sum(vol_vals) / len(vol_vals), 2) if vol_vals else None,
                 "top_stock":  top_s["ticker"],
                 "top_score":  top_s["score"],
                 "etf":        etf_t or "–",
@@ -1579,6 +1851,8 @@ with tab_industries:
                 "Avg Score":  r["avg_score"],
                 "Avg 1M%":    r["avg_1m"],
                 "Avg 3M%":    r["avg_3m"],
+                "MRSI%":      r["mrsi"],
+                "Avg Vol%":   r["avg_vol"],
                 "Top Stock":  r["top_stock"],
                 "Top Score":  r["top_score"],
                 "ETF":        r["etf"],
@@ -1598,8 +1872,8 @@ with tab_industries:
         styled_ind = (
             df_ind.style
             .map(_ind_score_style, subset=["Avg Score", "Top Score"])
-            .map(_pct_style,       subset=["Avg 1M%", "Avg 3M%"])
-            .format({"Avg 1M%": "{:+.2f}%", "Avg 3M%": "{:+.2f}%"}, na_rep="–")
+            .map(_pct_style,       subset=["Avg 1M%", "Avg 3M%", "MRSI%"])
+            .format({"Avg 1M%": "{:+.2f}%", "Avg 3M%": "{:+.2f}%", "MRSI%": "{:+.2f}%", "Avg Vol%": "{:.2f}%"}, na_rep="–")
             .format({"Avg Score": "{:.1f}", "Top Score": "{:.0f}"})
         )
         st.dataframe(styled_ind, width="stretch", height=min(600, 60 + len(tbl_rows) * 36))
@@ -1650,6 +1924,9 @@ with tab_industries:
         if drill_stocks:
             drill_rows = []
             for s in sorted(drill_stocks, key=lambda x: x["score"], reverse=True):
+                ind = (s.get("industry") or "").strip() or "Unclassified"
+                mrsi = float(_industry_regimes.get(ind, {}).get("mrsi", 0.0))
+                rs_val = s.get("rs_bench")
                 drill_rows.append({
                     "Ticker":  s["ticker"],
                     "Name":    (s.get("name") or "")[:28],
@@ -1661,18 +1938,22 @@ with tab_industries:
                     "3M%":     s.get("ret_3m"),
                     "1Y%":     s.get("ret_1y"),
                     "RS%":     s.get("rs_bench"),
+                    "MRSI%":   mrsi,
+                    "Outperf vs MRSI%": (round(float(rs_val) - mrsi, 2) if rs_val is not None and not pd.isna(rs_val) else None),
+                    "Vol 20d Ann%": _stock_volatility_pct(s.get("_df")),
+                    "Style": _classify_stock_style(s),
                     "RSI":     round(s["rsi"], 0) if s.get("rsi") else None,
                     "P/E":     round(s["pe"],  1) if s.get("pe")  else None,
                 })
             df_drill = pd.DataFrame(drill_rows)
-            pct_d: List[Hashable] = ["1M%", "3M%", "1Y%", "RS%"]
+            pct_d: List[Hashable] = ["1M%", "3M%", "1Y%", "RS%", "MRSI%", "Outperf vs MRSI%"]
             styled_drill = (
                 df_drill.style
                 .map(_score_style, subset=["Score"])
                 .map(_stage_style, subset=["Stage"])
                 .map(_pct_style,   subset=pct_d)
                 .format({c: "{:+.2f}%" for c in pct_d}, na_rep="–")
-                .format({"P/E": "{:.1f}", "RSI": "{:.0f}"}, na_rep="–")
+                .format({"P/E": "{:.1f}", "RSI": "{:.0f}", "Vol 20d Ann%": "{:.2f}%"}, na_rep="–")
             )
             st.dataframe(styled_drill, width="stretch",
                          height=min(700, 50 + len(drill_rows) * 36))
@@ -1723,6 +2004,7 @@ with tab_stocks:
                 "Ticker":  s["ticker"],
                 "Name":    (s.get("name") or "")[:28],
                 "Sector":  (s.get("sector") or ""),
+                "Industry": (s.get("industry") or ""),
                 "Score":   s["score"],
                 "Rating":  (s.get("rating") or "").replace("⭐ ","").replace("✅ ","").replace("👀 ","").replace("❌ ",""),
                 "Stage":   f"S{s.get('stage','?')}",
@@ -1731,6 +2013,18 @@ with tab_stocks:
                 "1Y%":     s.get("ret_1y"),
                 "RS%":     s.get("rs_bench"),
                 "RSI":     round(s["rsi"], 0)           if s.get("rsi")        else None,
+                "Vol 20d Ann%": _stock_volatility_pct(s.get("_df")),
+                "Vol Regime": _vol_bucket(_stock_volatility_pct(s.get("_df"))),
+                "Style": _classify_stock_style(s),
+                "MRSI%": _industry_regimes.get((s.get("industry") or "").strip() or "Unclassified", {}).get("mrsi", 0.0),
+                "Outperf vs MRSI%": (
+                    round(
+                        float(s.get("rs_bench")) - float(_industry_regimes.get((s.get("industry") or "").strip() or "Unclassified", {}).get("mrsi", 0.0)),
+                        2,
+                    )
+                    if s.get("rs_bench") is not None and not pd.isna(s.get("rs_bench"))
+                    else None
+                ),
                 "P/E":     round(s["pe"],  1)           if s.get("pe")         else None,
                 "EPS↑":    f"{s['eps_growth']*100:.0f}%" if s.get("eps_growth") is not None else "–",
                 "Felix Fit": felix_fit,
@@ -1828,6 +2122,29 @@ with tab_stocks:
                     help="Relative Strength Index momentum oscillator (0-100).",
                     format="%.0f",
                 ),
+                "Vol 20d Ann%": st.column_config.NumberColumn(
+                    "Vol 20d Ann%",
+                    help="Realized annualized volatility estimate from recent daily returns.",
+                    format="%.2f%%",
+                ),
+                "Vol Regime": st.column_config.TextColumn(
+                    "Vol Regime",
+                    help="Volatility bucket: Low / Medium / High.",
+                ),
+                "Style": st.column_config.TextColumn(
+                    "Style",
+                    help="Rule-based profile classification: Growth / Quality / Blend / Speculative.",
+                ),
+                "MRSI%": st.column_config.NumberColumn(
+                    "MRSI%",
+                    help="Industry strength proxy: average RS vs S&P of stocks in the same industry.",
+                    format="%.2f%%",
+                ),
+                "Outperf vs MRSI%": st.column_config.NumberColumn(
+                    "Outperf vs MRSI%",
+                    help="Stock RS minus industry MRSI. Positive means stock is outperforming its industry.",
+                    format="%.2f%%",
+                ),
                 "P/E": st.column_config.NumberColumn(
                     "P/E",
                     help="Price-to-earnings ratio.",
@@ -1842,6 +2159,8 @@ with tab_stocks:
         st.caption(
             "Score 0–100  ·  Stage S2 = advancing (ideal entry per Weinstein/Prehn)  "
             "·  RS% = 1Y return relative to S&P 500  "
+            "·  MRSI% = industry relative strength baseline  "
+            "·  Outperf vs MRSI% > 0 means stock leads its industry  "
             "·  Felix Fit = direct method alignment (money flow + heartbeat + MA + volume)  "
             "·  **Click a row to open it in Deep Dive ↗**"
         )
@@ -1924,6 +2243,20 @@ with tab_deep:
     m4.metric("1M Return",    f"{s['ret_1m']:+.2f}%" if s.get("ret_1m") is not None else "–")
     m5.metric("3M Return",    f"{s['ret_3m']:+.2f}%" if s.get("ret_3m") is not None else "–")
     m6.metric("RS vs S&P",    f"{s['rs_bench']:+.2f}%" if s.get("rs_bench") is not None else "–")
+
+    ind_key = (s.get("industry") or "").strip() or "Unclassified"
+    ind_regime = _industry_regimes.get(ind_key, {})
+    mrsi = float(ind_regime.get("mrsi", 0.0))
+    rs_val = s.get("rs_bench")
+    outperf_mrsi = (float(rs_val) - mrsi) if rs_val is not None and not pd.isna(rs_val) else None
+    vol_20d = _stock_volatility_pct(s.get("_df"))
+
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("Vol 20d Ann", f"{vol_20d:.2f}%" if vol_20d is not None else "–")
+    d2.metric("Vol Regime", _vol_bucket(vol_20d))
+    d3.metric("Industry MRSI", f"{mrsi:+.2f}%")
+    d4.metric("Outperf vs MRSI", f"{outperf_mrsi:+.2f}%" if outperf_mrsi is not None else "–")
+    d5.metric("Style", _classify_stock_style(s))
 
     st.markdown(f"> **Rating:** {s.get('rating','')}")
     st.divider()
